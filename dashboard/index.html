@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>best-buy 监控面板</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div>
+        <div class="eyebrow">best-buy live</div>
+        <h1 id="pageTitle">--</h1>
+      </div>
+    </header>
+
+    <section class="stock-tabs-bar" aria-label="监控标的">
+      <div class="stock-tabs" id="stockTabs"></div>
+      <button class="add-stock-btn" type="button" id="openStockModal" aria-label="添加股票">+</button>
+    </section>
+
+    <section class="view-tabs-bar" aria-label="页面视图">
+      <nav class="tabs" aria-label="页面">
+        <button class="tab active" type="button" data-tab="monitor">实时监控</button>
+        <button class="tab" type="button" data-tab="ai">问 AI</button>
+      </nav>
+    </section>
+
+    <section class="tab-page active" id="tab-monitor">
+      <section class="ticker-strip">
+        <div>
+          <div class="muted">标的</div>
+          <div class="ticker-main"><span id="symbol">07709</span><strong id="price">--</strong></div>
+        </div>
+        <div>
+          <div class="muted">区间</div>
+          <strong id="zone">--</strong>
+        </div>
+        <div>
+          <div class="muted">动作</div>
+          <strong id="action">--</strong>
+        </div>
+        <div>
+          <div class="muted">确认分</div>
+          <strong id="confirm">--</strong>
+        </div>
+        <div>
+          <div class="muted">更新时间</div>
+          <strong id="meta">等待数据</strong>
+        </div>
+      </section>
+
+      <section class="panel short-panel">
+        <div class="panel-head"><h2>短线操作</h2><span class="muted" id="shortNote">--</span></div>
+        <div class="short-grid">
+          <div>
+            <div class="short-label">短线买点</div>
+            <div class="pill-list" id="shortEntries"></div>
+          </div>
+          <div>
+            <div class="short-label">短线卖点</div>
+            <div class="pill-list" id="shortExits"></div>
+          </div>
+          <div>
+            <div class="short-label">短线止损</div>
+            <strong class="stop-price" id="shortStop">--</strong>
+          </div>
+        </div>
+      </section>
+
+      <section class="grid-main">
+        <details class="panel decision-panel compact-details">
+          <summary>
+            <span>核心判断</span>
+            <strong id="decisionSummary">--</strong>
+            <em id="updatedAt">--</em>
+          </summary>
+          <div class="decision-list details-body">
+            <div class="decision-row"><span>买</span><strong id="buyText">--</strong><em id="ma20Text">--</em></div>
+            <div class="decision-row"><span>卖</span><strong id="sellText">--</strong></div>
+            <div class="decision-row"><span>确认</span><strong id="confirmText">--</strong></div>
+            <div class="decision-row"><span>预动量</span><strong id="premomentumText">--</strong></div>
+            <div class="decision-row"><span>动量</span><strong id="momentumText">--</strong></div>
+            <div class="decision-row"><span>备注</span><strong id="noteText">--</strong></div>
+          </div>
+        </details>
+
+        <article class="panel levels-panel">
+          <div class="levels-grid">
+            <div>
+              <div class="panel-head"><h2>深回撤备用</h2></div>
+              <div class="level-list" id="supports"></div>
+              <div class="batch-line"><span>备用价位</span><strong id="buyLevels">--</strong></div>
+            </div>
+            <div>
+              <div class="panel-head"><h2>阻力 / 卖点</h2></div>
+              <div class="level-list" id="resistances"></div>
+              <div class="batch-line"><span>分批卖点</span><strong id="sellLevels">--</strong></div>
+            </div>
+          </div>
+        </article>
+      </section>
+
+      <section class="grid-secondary">
+        <article class="panel">
+          <div class="panel-head"><h2>参照对象</h2></div>
+          <div id="refs" class="refs"></div>
+        </article>
+        <article class="panel">
+          <div class="panel-head"><h2>最近监控记录</h2></div>
+          <div id="feed" class="feed"></div>
+        </article>
+      </section>
+    </section>
+
+    <section class="tab-page" id="tab-ai">
+      <section class="ai-layout">
+        <details class="panel context-panel compact-details">
+          <summary><span>当前上下文</span><strong id="aiContextSummary">--</strong></summary>
+          <div id="aiContext" class="context-list details-body"></div>
+        </details>
+        <section class="panel chat-panel">
+          <div class="panel-head">
+            <h2>问 AI</h2>
+            <button class="ghost-btn" type="button" id="clearChat">清空</button>
+          </div>
+          <div class="chat-hint">对话记录保存在本机浏览器；清空后历史对话会删除，但每次提问仍会带当前行情上下文。</div>
+          <div id="chatLog" class="chat-log" aria-live="polite"></div>
+          <form id="chatForm" class="chat-form">
+            <textarea id="chatInput" rows="3" placeholder="问一下当前盘口、买卖点、韩国正股影响、止损止盈..."></textarea>
+            <button type="submit">发送</button>
+          </form>
+        </section>
+      </section>
+    </section>
+  </main>
+
+  <div class="modal-backdrop" id="stockModal" hidden>
+    <section class="modal" role="dialog" aria-modal="true" aria-labelledby="stockModalTitle">
+      <div class="modal-head">
+        <h2 id="stockModalTitle">添加监控标的</h2>
+        <button class="ghost-btn icon-btn" type="button" id="closeStockModal" aria-label="关闭">×</button>
+      </div>
+      <label class="search-field">
+        <span class="muted">股票代码或名称</span>
+        <input id="stockSearchInput" type="search" autocomplete="off" placeholder="例如 MU、0700、腾讯" />
+      </label>
+      <div id="stockSearchStatus" class="search-status">输入关键词开始搜索</div>
+      <div id="stockSearchResults" class="search-results"></div>
+    </section>
+  </div>
+
+  <script src="./app.js"></script>
+</body>
+</html>
