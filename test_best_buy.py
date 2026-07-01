@@ -3,7 +3,8 @@ import time
 import unittest
 from unittest.mock import patch
 
-from best_buy_app.core.decision_engine import classify_zone, confirmation_score, final_action, final_action_with_momentum, momentum_decision, premomentum_decision, render_watch_tick, short_term_plan, trade_plan
+from best_buy_app.core.decision_engine import buy_decision, classify_zone, confirmation_score, final_action, final_action_with_momentum, momentum_decision, premomentum_decision, render_watch_tick, sell_decision, short_term_plan, trade_plan
+from best_buy_app.core.indicators import analyze, fib_retrace
 from best_buy_app.cli.best_buy import parse_leveraged
 from best_buy_app.web.dashboard_server import AI_INSTRUCTIONS, build_global_stock_context, build_news_context, build_responses_input, call_external_ai, compact_ai_context, default_global_stock_plan, enrich_feed_for_ai, local_reply, minimal_responses_payload, parse_json_object, parse_responses_text, parse_stream_text_delta
 from best_buy_app.data import storage
@@ -65,6 +66,80 @@ class TestBestBuy(unittest.TestCase):
         res = confirmation_score(main, [peer], market)
         self.assertGreaterEqual(res["score"], 2)
 
+    def test_default_strategy_relaxes_bottom_entry_and_limits_chasing(self):
+        with open("config.json", "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+
+        st = cfg["strategy"]
+        self.assertEqual(st["buy_zone_buffer"], 0.035)
+        self.assertEqual(st["rsi_buy"], 35)
+        self.assertEqual(st["kdj_buy_j"], 10)
+        self.assertEqual(st["momentum"]["chase_limit_pct"], 2.5)
+
+    def test_fib_retrace_defaults_to_sixty_bars(self):
+        rows = []
+        for i in range(70):
+            rows.append({"high": 100 + i, "low": 90 + i, "close": 95 + i})
+        rows[15]["low"] = 40
+        rows[5]["low"] = 10
+
+        hi, lo, _ = fib_retrace(rows)
+
+        self.assertEqual(hi, 169)
+        self.assertEqual(lo, 40)
+
+    def test_analyze_returns_volume_ratio(self):
+        rows = []
+        for i in range(61):
+            rows.append({
+                "date": f"2026-01-{(i % 28) + 1:02d}",
+                "open": 100 + i,
+                "high": 102 + i,
+                "low": 99 + i,
+                "close": 101 + i,
+                "volume": 100,
+            })
+        rows[-1]["volume"] = 50
+
+        res = analyze(rows, "main")
+
+        self.assertEqual(res["volume_ratio"], 0.56)
+
+    def test_buy_decision_scores_long_lower_shadow_and_penalizes_weak_volume_breakout(self):
+        base = {
+            "close": 101,
+            "ma": {20: 100},
+            "rsi14": 50,
+            "kdj": {"j": 50, "k": 50, "d": 55, "cross": "死叉"},
+            "macd": {"hist": 1, "shortening": False},
+            "candle": {"is_long_lower_shadow": True},
+            "boll": {"upper": 110, "lower": 90},
+            "resistances": [{"level": "R1", "price": 100}],
+            "volume_ratio": 0.7,
+        }
+
+        res = buy_decision(base)
+
+        self.assertIn("探底反转", " ".join(s[1] for s in res["signals"]))
+        self.assertIn("缩量反弹", " ".join(s[1] for s in res["signals"]))
+        self.assertEqual(res["score"], 1)
+
+    def test_sell_decision_ignores_rsi_overbought_in_strong_uptrend(self):
+        analysis = {
+            "close": 110,
+            "ma": {5: 108, 10: 104, 20: 100},
+            "rsi14": 75,
+            "kdj": {"j": 50, "k": 50, "d": 45},
+            "macd": {"hist": 1, "shortening": False},
+            "boll": {"upper": 130},
+            "candle": {},
+        }
+
+        res = sell_decision(analysis)
+
+        self.assertEqual(res["score"], 0)
+        self.assertIn("强多头排列", " ".join(s[1] for s in res["signals"]))
+
     def test_trade_plan_uses_watch_zone_when_buy_signal_is_weak(self):
         analysis = {
             "close": 100,
@@ -98,6 +173,44 @@ class TestBestBuy(unittest.TestCase):
         plan = trade_plan(analysis, {"verdict": "ok", "score": 2})
         self.assertIsNotNone(plan["buy_zone"])
         self.assertIsNone(plan["watch_zone"])
+
+    def test_trade_plan_uses_ma10_as_support_anchor(self):
+        analysis = {
+            "close": 142.5,
+            "ma": {10: 142, 20: 139, 60: 130},
+            "rsi14": 50,
+            "kdj": {"j": 50, "k": 50, "d": 55, "cross": "死叉"},
+            "macd": {"hist": 1, "shortening": False},
+            "candle": {},
+            "boll": {"upper": 150, "lower": 136},
+            "supports": [{"level": "S1", "price": 139, "dist_pct": -2.5}],
+            "resistances": [{"level": "R1", "price": 150, "dist_pct": 5.3}],
+        }
+
+        plan = trade_plan(analysis, {"verdict": "ok", "score": 2})
+
+        self.assertEqual(plan["watch_anchor"], {"level": "MA10", "price": 142})
+
+    def test_trade_plan_raises_stop_loss_with_trailing_stop(self):
+        analysis = {
+            "close": 145,
+            "ma": {10: 142, 20: 139, 60: 130},
+            "rsi14": 50,
+            "kdj": {"j": 50, "k": 50, "d": 55, "cross": "死叉"},
+            "macd": {"hist": 1, "shortening": False},
+            "candle": {},
+            "boll": {"upper": 152, "lower": 140},
+            "supports": [{"level": "S1", "price": 139, "dist_pct": -4.1}],
+            "resistances": [{"level": "R1", "price": 150, "dist_pct": 3.4}],
+            "recent": [
+                {"date": "2026-01-01", "close": 144, "high": 146, "low": 140},
+                {"date": "2026-01-02", "close": 145, "high": 150, "low": 143},
+            ],
+        }
+
+        plan = trade_plan(analysis, {"verdict": "ok", "score": 2})
+
+        self.assertEqual(plan["stop_loss"], 144)
 
     def test_short_term_plan_prefers_nearby_entries(self):
         analysis = {
@@ -204,6 +317,18 @@ class TestBestBuy(unittest.TestCase):
         self.assertGreaterEqual(res["pct"], 5)
         self.assertIn("谨慎追高", res["verdict"])
         self.assertIn("谨慎追高", final_action_with_momentum({"score": 0}, sell, confirm, res))
+
+    def test_momentum_decision_blocks_large_rebound_from_intraday_low(self):
+        history = [
+            {"time": "13:20:10", "price": 145.0},
+            {"time": "13:21:25", "price": 140.0},
+            {"time": "13:22:30", "price": 145.0},
+        ]
+        analysis = {"resistances": [{"level": "R1", "price": 144, "dist_pct": -0.7}]}
+        res = momentum_decision(history, analysis, {"score": 4}, {"score": 1}, {"strategy": {"momentum": {"chase_limit_pct": 10}}})
+
+        self.assertFalse(res["active"])
+        self.assertIn("日内低点", " ".join(s[1] for s in res["signals"]))
 
     def test_premomentum_detects_upstream_lead_before_07709_moves(self):
         main_history = [

@@ -60,7 +60,7 @@ def macd(rows, fast=12, slow=26, signal=9):
     return (dif[-1] - dea[-1]) * 2, dif[-1], dea[-1], dif[-2], dea[-2]
 
 
-def fib_retrace(rows, lb=20):
+def fib_retrace(rows, lb=60):
     w = rows[-lb:]
     if len(w) < 2:
         return None, None, {}
@@ -137,6 +137,9 @@ def analyze(rows, label):
     hi, lo, fib_sup = fib_retrace(rows)
     _, _, fib_res = fib_ext(rows)
     mas = {p: ma(rows, p) for p in (5, 10, 20, 60)}
+    vol_5 = sum(r.get("volume", 0) or 0 for r in rows[-5:]) / 5 if len(rows) >= 5 else 0
+    current_vol = rows[-1].get("volume", 0) or 0
+    vol_ratio = current_vol / vol_5 if vol_5 else 1.0
 
     supports = []
     if fib_sup:
@@ -189,6 +192,7 @@ def analyze(rows, label):
             "shortening": (abs(hist) < abs((dif2 - dea2) * 2)) if (hist is not None and dif2 is not None and dea2 is not None) else None,
         },
         "candle": candle_shape(rows),
+        "volume_ratio": round(vol_ratio, 2),
         "supports": supports,
         "resistances": resistances,
         "recent": [{"date": r["date"], "close": r["close"], "high": r["high"], "low": r["low"]} for r in rows[-6:]],

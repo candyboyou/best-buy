@@ -1,12 +1,12 @@
 {
   "strategy": {
-    "rsi_buy": 30,
+    "rsi_buy": 35,
     "rsi_sell": 70,
-    "kdj_buy_j": 0,
+    "kdj_buy_j": 10,
     "kdj_sell_j": 100,
     "buy_ma": 20,
     "buy_ma_tolerance": 0.02,
-    "buy_zone_buffer": 0.018,
+    "buy_zone_buffer": 0.035,
     "buy_zone_max_width_pct": 0.035,
     "sell_boll_tolerance": 0.98,
     "stop_loss_support_buffer": 0.015,
@@ -24,7 +24,7 @@
       "lookback_ticks": 20,
       "trigger_pct": 3.0,
       "strong_pct": 5.0,
-      "chase_limit_pct": 4.0,
+      "chase_limit_pct": 2.5,
       "confirm_min": 2,
       "sell_score_block": 3
     },

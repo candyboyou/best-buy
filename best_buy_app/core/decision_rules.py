@@ -60,6 +60,7 @@ def buy_decision(a, cfg=None):
     ma_tolerance = st.get("buy_ma_tolerance", 0.02)
     buy_ma = st.get("buy_ma", 20)
     target_ma = a["ma"].get(buy_ma) if a.get("ma") else None
+    score_adjust = 0
     if rsi_v is not None and rsi_v < rsi_buy:
         sigs.append(("✅", f"RSI14={rsi_v} 超卖"))
     else:
@@ -82,9 +83,21 @@ def buy_decision(a, cfg=None):
         sigs.append(("✅", "KDJ 金叉上行"))
     else:
         sigs.append(("❌", "KDJ 死叉下行"))
-    score = sum(1 for s in sigs if s[0] == "✅")
+    candle = a.get("candle", {})
+    if candle.get("is_long_lower_shadow"):
+        sigs.append(("✅", "日内出现长下影线，资金承接强(探底反转)"))
+    else:
+        sigs.append(("➖", "无明显底部反转K线形态"))
+
+    first_res = (a.get("resistances") or [None])[0]
+    broke_resistance = bool(first_res and close >= first_res.get("price", close + 1) * 0.998)
+    if broke_resistance and a.get("volume_ratio", 1) < 0.8:
+        score_adjust -= 1
+        sigs.append(("❌", f"缩量反弹/突破，量比={a.get('volume_ratio')}，削弱买入可信度"))
+
+    score = max(0, sum(1 for s in sigs if s[0] == "✅") + score_adjust)
     verdict = (
-        f"可考虑分批轻仓试探（{score}/5 信号达标）"
+        f"可考虑分批轻仓试探（{score}/6 信号达标）"
         if score >= 2
         else ("信号不足，继续等待" if score == 1 else "无买入信号，暂不建议追多")
     )
@@ -108,8 +121,14 @@ def sell_decision(a, cfg=None):
     rsi_sell = st.get("rsi_sell", 70)
     kdj_sell_j = st.get("kdj_sell_j", 100)
     sell_boll_tolerance = st.get("sell_boll_tolerance", 0.98)
+    mas = a.get("ma", {})
+    ma5, ma10, ma20 = mas.get(5), mas.get(10), mas.get(20)
+    is_strong_uptrend = bool(ma5 and ma10 and ma20 and (ma5 > ma10 > ma20))
     if rsi_v is not None and rsi_v > rsi_sell:
-        sigs.append(("✅", f"RSI14={rsi_v} 超买"))
+        if is_strong_uptrend:
+            sigs.append(("➖", f"RSI14={rsi_v}超买，但处于强多头排列，忽略超买卖压"))
+        else:
+            sigs.append(("✅", f"RSI14={rsi_v} 超买"))
     else:
         sigs.append(("❌", f"RSI14={rsi_v} 未超买(需>{rsi_sell})"))
     if j > kdj_sell_j or (k > 80 and k < d):
@@ -154,6 +173,8 @@ def momentum_decision(price_history, analysis, confirmation, sell=None, cfg=None
     base_item = min(window[:-1], key=lambda x: x["price"]) if len(window) > 1 else window[0]
     base = base_item["price"]
     pct = (current / base - 1) * 100 if base else 0
+    intraday_low = min(x["price"] for x in window)
+    rebound_from_low = (current / intraday_low - 1) * 100 if intraday_low else 0
     trigger_pct = st.get("trigger_pct", 3.0)
     strong_pct = st.get("strong_pct", 5.0)
     chase_limit_pct = st.get("chase_limit_pct", 4.0)
@@ -164,6 +185,10 @@ def momentum_decision(price_history, analysis, confirmation, sell=None, cfg=None
 
     signals = []
     score = 0
+    blocked_by_rebound = rebound_from_low >= 3.5
+    if blocked_by_rebound:
+        score -= 2
+        signals.append(("❌", f"距日内低点已反弹+{rebound_from_low:.1f}%，放弃追高动量"))
     if pct >= trigger_pct:
         score += 1
         signals.append(("✅", f"盘中动量+{pct:.1f}%"))
@@ -188,8 +213,8 @@ def momentum_decision(price_history, analysis, confirmation, sell=None, cfg=None
     elif first_res:
         signals.append(("➖", f"未突破近端阻力{first_res['level']}={fmt_num(first_res['price'])}"))
 
-    active = score >= 3 and trigger_pct <= pct < chase_limit_pct
-    extended = score >= 3 and pct >= chase_limit_pct
+    active = not blocked_by_rebound and score >= 3 and trigger_pct <= pct < chase_limit_pct
+    extended = blocked_by_rebound or (score >= 3 and pct >= chase_limit_pct)
     if extended:
         verdict = f"强动量已拉升，谨慎追高，等回踩或下一次预动量（+{pct:.1f}%）"
     elif active and pct >= strong_pct:
@@ -377,9 +402,8 @@ def trade_plan(analysis, confirmation, cfg=None):
     close = analysis.get("close")
     supports = analysis.get("supports", [])
     resistances = analysis.get("resistances", [])
-    buy_ma = st.get("buy_ma", 20)
-    ma20 = analysis.get("ma", {}).get(buy_ma)
-    ma60 = analysis.get("ma", {}).get(60)
+    mas = analysis.get("ma", {})
+    ma60 = mas.get(60)
     buy_score = buy_decision(analysis, cfg).get("score", 0)
     confirm_score = (confirmation or {}).get("score", 0)
     zone_buffer = st.get("buy_zone_buffer", st.get("buy_ma_tolerance", 0.02))
@@ -396,8 +420,10 @@ def trade_plan(analysis, confirmation, cfg=None):
         price = s.get("price")
         if price:
             support_candidates.append({"level": s.get("level", "支撑"), "price": price})
-    if ma20:
-        support_candidates.append({"level": f"MA{buy_ma}", "price": ma20})
+    for p in (10, 20):
+        ma_val = mas.get(p)
+        if ma_val:
+            support_candidates.append({"level": f"MA{p}", "price": ma_val})
 
     anchor = None
     if close and support_candidates:
@@ -430,6 +456,12 @@ def trade_plan(analysis, confirmation, cfg=None):
         stop_loss = round(ma60 * (1 - st.get("stop_loss_ma60_buffer", 0.02)), 2)
     elif atr_like and close:
         stop_loss = round(close - atr_like * st.get("stop_loss_atr_multiplier", 1.5), 2)
+    recent = analysis.get("recent", [])
+    recent_high = max((r["high"] for r in recent if r.get("high") is not None), default=close)
+    if atr_like and recent_high:
+        trailing_stop = round(recent_high - atr_like * 2.0, 2)
+        if stop_loss is None or trailing_stop > stop_loss:
+            stop_loss = trailing_stop
     take_profit = []
     tp_count = st.get("take_profit_count", 3)
     for r in resistances[:tp_count]:
