@@ -6,7 +6,7 @@ import re
 from datetime import datetime
 from urllib.parse import urlencode
 
-from best_buy_app.data.market_data import UA, curl, first_valid_quote
+from best_buy_app.data.market_data import UA, curl, first_valid_quote, primary_quote_with_fallback
 
 
 def _float(v):
@@ -188,10 +188,10 @@ def hk_stock_quote_sina(code):
 def stock_quote(symbol):
     meta = normalize_symbol(symbol)
     if meta["kind"] == "hk":
-        q = first_valid_quote([
-            (hk_stock_quote_tencent, (meta["code"],)),
+        q = primary_quote_with_fallback(
             (hk_stock_quote_sina, (meta["code"],)),
-        ], timeout=10)
+            [(hk_stock_quote_tencent, (meta["code"],))],
+        )
     else:
         q = first_valid_quote([
             (us_stock_quote_sina, (meta["code"],)),

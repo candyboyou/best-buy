@@ -1,0 +1,86 @@
+<h2>核心决策指挥横条：数据来源怎么选？</h2>
+<p class="subtitle">位置：放在虚拟纸面持仓安全线上方。目标：一眼给出当前操作定调。</p>
+
+<div class="split">
+  <div class="mockup">
+    <div class="mockup-header">A. 规则引擎实时计算（推荐）</div>
+    <div class="mockup-body">
+      <div style="border:1px solid #d9e2ef;border-radius:8px;padding:12px;background:#fff">
+        <div style="font-weight:800;color:#172033;margin-bottom:8px">核心决策指挥横条</div>
+        <div style="display:flex;gap:8px;align-items:center;border:1px solid #bfd0e4;border-radius:8px;padding:10px;background:#f8fafc">
+          <span style="font-size:18px">🟢</span>
+          <strong style="color:#079455">多周期顺风共振，可分批轻仓试探布局</strong>
+        </div>
+      </div>
+      <div class="pros-cons" style="margin-top:14px">
+        <div class="pros">
+          <h4>优点</h4>
+          <ul>
+            <li>跟随 4 秒行情刷新，稳定低延迟</li>
+            <li>和买入分、确认分、动量状态完全一致</li>
+            <li>无费用、无 API 失败、无幻觉</li>
+          </ul>
+        </div>
+        <div class="cons">
+          <h4>代价</h4>
+          <ul>
+            <li>文案模板化，需要手工设计几档口径</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="mockup">
+    <div class="mockup-header">B. 大模型每分钟生成</div>
+    <div class="mockup-body">
+      <div style="border:1px solid #d9e2ef;border-radius:8px;padding:12px;background:#fff">
+        <div style="font-weight:800;color:#172033;margin-bottom:8px">核心决策指挥横条</div>
+        <div style="display:flex;gap:8px;align-items:center;border:1px solid #bfd0e4;border-radius:8px;padding:10px;background:#f8fafc">
+          <span style="font-size:18px">🟡</span>
+          <strong style="color:#b7791f">短线仍可观察，但不宜追高</strong>
+        </div>
+      </div>
+      <div class="pros-cons" style="margin-top:14px">
+        <div class="pros">
+          <h4>优点</h4>
+          <ul>
+            <li>文案更自然，能综合新闻和上下文</li>
+          </ul>
+        </div>
+        <div class="cons">
+          <h4>风险</h4>
+          <ul>
+            <li>1 分钟延迟，盘中急变会滞后</li>
+            <li>可能和规则引擎分数不一致</li>
+            <li>有费用、失败重试和缓存问题</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="options">
+  <div class="option" data-choice="a" onclick="toggleSelect(this)">
+    <div class="letter">A</div>
+    <div class="content">
+      <h3>规则引擎实时横条</h3>
+      <p>用现有 buy/sell/confirm/momentum/premomentum/action 生成一句固定口径。</p>
+    </div>
+  </div>
+  <div class="option" data-choice="b" onclick="toggleSelect(this)">
+    <div class="letter">B</div>
+    <div class="content">
+      <h3>大模型每分钟横条</h3>
+      <p>后台缓存 AI 生成结果，每分钟刷新一次，失败时回退规则文案。</p>
+    </div>
+  </div>
+  <div class="option" data-choice="c" onclick="toggleSelect(this)">
+    <div class="letter">C</div>
+    <div class="content">
+      <h3>混合方案</h3>
+      <p>主横条永远规则实时；AI 只用于下方审计备注或手动“问 AI”。</p>
+    </div>
+  </div>
+</div>

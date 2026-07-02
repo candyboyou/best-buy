@@ -20,6 +20,30 @@ DEFAULT_CONFIG = {
         "stop_loss_ma60_buffer": 0.02,
         "stop_loss_atr_multiplier": 1.5,
         "take_profit_count": 3,
+        "volatility_adaptive": {
+            "enabled": True,
+            "atr_period": 14,
+            "buy_zone_buffer_atr_multiplier": 1.0,
+            "buy_zone_max_width_atr_multiplier": 1.0,
+            "min_buffer_pct": 0.01,
+            "max_buffer_pct": 0.06,
+        },
+        "relative_strength": {
+            "support_bonus_alpha_pct": 2.0,
+            "support_near_pct": 0.005,
+        },
+        "mtfa": {
+            "enabled": True,
+            "intraday_rsi_buy": 30,
+            "bonus_score": 2,
+        },
+        "sentiment_alpha": {
+            "enabled": True,
+            "positive_score": 3,
+            "negative_score": -3,
+            "rsi_buy_relax": 5,
+            "chase_limit_tighten_pct": 1.0,
+        },
         "short_term": {
             "pullback_pct": 0.012,
             "breakout_buffer_pct": 0.003,
@@ -34,6 +58,7 @@ DEFAULT_CONFIG = {
             "chase_limit_pct": 4.0,
             "confirm_min": 2,
             "sell_score_block": 3,
+            "vwap_volume_ratio_min": 1.2,
         },
         "premomentum": {
             "enabled": True,
@@ -54,6 +79,8 @@ DEFAULT_CONFIG = {
             "peer_rsi_min": 50,
             "market_rsi_min": 45,
             "market_rsi_max": 65,
+            "rs_market_outperform_pct": 2.0,
+            "rs_peer_outperform_pct": 2.0,
             "weighted_threshold_support": 65,
             "weighted_threshold_neutral": 45,
             "weights": {
@@ -84,7 +111,7 @@ DEFAULT_CONFIG = {
         "min_interval_seconds": 5,
         "rows_refresh_seconds": 600,
         "peer_rows_refresh_seconds": 900,
-        "quote_refresh_seconds": 15,
+        "quote_refresh_seconds": 3,
         "peer_quote_refresh_seconds": 60,
         "market_quote_refresh_seconds": 60,
         "market_hours_enabled": True,

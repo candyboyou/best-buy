@@ -4,28 +4,54 @@
 import json
 import queue
 import re
-import subprocess
 import threading
 import time
 from datetime import datetime
 
+import requests
+from requests.adapters import HTTPAdapter
+
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
 
+# 进程内复用的 Session（连接池 keep-alive），替代每次 fork curl 子进程
+_session = None
 
-def curl(url, headers=None, enc="utf-8", timeout=30):
-    cmd = ["curl", "-s", "-A", UA]
+
+def _get_session():
+    global _session
+    if _session is None:
+        s = requests.Session()
+        s.headers.update({"User-Agent": UA})
+        adapter = HTTPAdapter(pool_connections=32, pool_maxsize=32, max_retries=0)
+        s.mount("http://", adapter)
+        s.mount("https://", adapter)
+        _session = s
+    return _session
+
+
+def curl(url, headers=None, enc="utf-8", timeout=8):
+    """进程内 HTTP GET，返回解码后的文本；失败返回空串。
+
+    timeout 可为秒数（read）或 (connect, read) 元组。
+    """
+    if isinstance(timeout, tuple):
+        connect_timeout, read_timeout = timeout
+    else:
+        connect_timeout, read_timeout = 5, timeout
+    hdr = {"User-Agent": UA}
     if headers:
-        for h in headers:
-            cmd += ["-H", h]
-    cmd += [url]
+        for item in headers:
+            if ":" in item:
+                k, v = item.split(":", 1)
+                hdr[k.strip()] = v.strip()
     try:
-        raw = subprocess.run(cmd, capture_output=True, timeout=timeout).stdout
+        r = _get_session().get(url, headers=hdr, timeout=(connect_timeout, read_timeout))
     except Exception:
         return ""
     try:
-        return raw.decode(enc, errors="replace")
+        return r.content.decode(enc, errors="replace")
     except Exception:
-        return raw.decode("utf-8", errors="replace")
+        return r.content.decode("utf-8", errors="replace")
 
 
 def _f(v):
@@ -80,6 +106,20 @@ def first_valid_quote(requests, timeout=30):
     return fallback
 
 
+def primary_quote_with_fallback(primary, fallbacks):
+    fallback = {}
+    for fn, args in [primary] + list(fallbacks):
+        try:
+            quote = fn(*args) or {}
+        except Exception:
+            quote = {}
+        if _has_price(quote):
+            return quote
+        if quote and not fallback:
+            fallback = quote
+    return fallback
+
+
 def yahoo_chart(symbol, interval="1d", range_="3mo"):
     out = curl(
         f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}"
@@ -120,7 +160,11 @@ def yahoo_chart(symbol, interval="1d", range_="3mo"):
 
 
 def hk_quote_tencent(code):
-    txt = curl(f"https://qt.gtimg.cn/q=r_hk{code}", enc="gbk")
+    # 优先简要接口 s_hk（响应小、几十 ms），失败回退完整 r_hk
+    quote = _hk_quote_tencent_simple(code)
+    if _has_price(quote):
+        return quote
+    txt = curl(f"https://qt.gtimg.cn/q=r_hk{code}", enc="gbk", timeout=5)
     m = re.search(r'"(.+)"', txt)
     if not m:
         return {}
@@ -139,6 +183,31 @@ def hk_quote_tencent(code):
         "volume": _f(f[6]),
         "amount": _f(f[37]),
         "timestamp": f[30],
+    }
+
+
+def _hk_quote_tencent_simple(code):
+    """腾讯 s_hk 简要接口：100~名称~代码~最新价~涨跌~涨跌幅~成交量~成交额"""
+    txt = curl(f"https://qt.gtimg.cn/q=s_hk{code}", enc="gbk", timeout=5)
+    m = re.search(r'"(.+)"', txt)
+    if not m:
+        return {}
+    f = m.group(1).split("~")
+    if len(f) < 6:
+        return {}
+    price = _f(f[3])
+    change = _f(f[4])
+    if price is None:
+        return {}
+    return {
+        "source": "tencent",
+        "name": f[1],
+        "price": price,
+        "prev_close": round(price - change, 4) if change is not None else None,
+        "change_pct": _f(f[5]),
+        "volume": _f(f[6]) if len(f) > 6 else None,
+        "amount": _f(f[7]) if len(f) > 7 else None,
+        "timestamp": None,
     }
 
 
@@ -163,6 +232,30 @@ def hk_quote_sina(code):
         "high": _f(f[4]),
         "low": _f(f[5]),
         "change_pct": _f(f[8]),
+        "timestamp": None,
+    }
+
+
+def us_quote_tencent(ticker):
+    """腾讯 s_us 简要接口：200~名称~代码~最新价~涨跌~涨跌幅~成交量~成交额"""
+    txt = curl(f"https://qt.gtimg.cn/q=s_us{ticker.upper()}", enc="gbk", timeout=5)
+    m = re.search(r'"(.+)"', txt)
+    if not m:
+        return {}
+    f = m.group(1).split("~")
+    if len(f) < 6:
+        return {}
+    price = _f(f[3])
+    change = _f(f[4])
+    if price is None:
+        return {}
+    return {
+        "source": "tencent",
+        "name": f[1],
+        "price": price,
+        "prev_close": round(price - change, 4) if change is not None else None,
+        "change_pct": _f(f[5]),
+        "volume": _f(f[6]) if len(f) > 6 else None,
         "timestamp": None,
     }
 
@@ -223,21 +316,22 @@ def fetch_quote(symbol):
     s = symbol.upper()
     if re.match(r"^0?\d{4,5}$", s):
         code = s.zfill(5)
-        return first_valid_quote([
-            (hk_quote_tencent, (code,)),
+        return primary_quote_with_fallback(
             (hk_quote_sina, (code,)),
-        ])
+            [(hk_quote_tencent, (code,))],
+        )
     m = re.match(r"^0?(\d{4,5})\.HK$", s)
     if m:
         code = m.group(1).zfill(5)
-        return first_valid_quote([
-            (hk_quote_tencent, (code,)),
+        return primary_quote_with_fallback(
             (hk_quote_sina, (code,)),
-        ])
+            [(hk_quote_tencent, (code,))],
+        )
     if re.match(r"^[A-Z.]+$", s) and ".HK" not in s:
         return first_valid_quote([
-            (yahoo_quote, (symbol,)),
+            (us_quote_tencent, (s,)),
             (us_quote_sina, (s,)),
+            (yahoo_quote, (symbol,)),
         ])
     return {}
 

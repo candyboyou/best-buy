@@ -122,6 +122,47 @@ def market_status(markets, now=None):
     }
 
 
+def intraday_progress(market, now=None):
+    """返回当日盘中交易进度，用于日线盘中量能投影。
+
+    正确处理港股午休双窗口：elapsed 只累加已走完的交易时段分钟数。
+    非交易日或盘前/盘后返回 is_open=False、progress=0.0，调用方据此跳过投影。
+    """
+    cfg = MARKETS.get(market)
+    if not cfg:
+        return {"elapsed_minutes": 0, "total_minutes": 0, "is_open": False, "paused": False, "progress": 0.0}
+    local_now = (now or datetime.now().astimezone()).astimezone(ZoneInfo(cfg["tz"]))
+    day = local_now.date()
+    if not is_trading_day(market, day):
+        return {"elapsed_minutes": 0, "total_minutes": 0, "is_open": False, "paused": False, "progress": 0.0}
+    windows = trading_windows(market, day)
+    current = local_now.time()
+    total_minutes = 0
+    elapsed_minutes = 0
+    is_open = False
+    for start, end in windows:
+        window_minutes = int((datetime.combine(day, end) - datetime.combine(day, start)).total_seconds() // 60)
+        total_minutes += window_minutes
+        if current < start:
+            continue  # 该时段尚未开始
+        if current >= end:
+            elapsed_minutes += window_minutes  # 整段已结束
+        else:
+            elapsed_minutes += int((datetime.combine(day, current) - datetime.combine(day, start)).total_seconds() // 60)
+            is_open = True
+    progress = elapsed_minutes / total_minutes if total_minutes else 0.0
+    # 午休等日内间隙：已走过部分时段(is_open=False, elapsed>0)但尚未到当日最后一窗结束。
+    # 此时应保持投影连续(progress 冻结在已走完时段)，避免 12:00 量比断崖式崩塌。
+    last_end = windows[-1][1] if windows else None
+    paused = bool(
+        not is_open
+        and elapsed_minutes > 0
+        and last_end is not None
+        and current < last_end
+    )
+    return {"elapsed_minutes": elapsed_minutes, "total_minutes": total_minutes, "is_open": is_open, "paused": paused, "progress": progress}
+
+
 def market_labels(markets):
     return [MARKETS[m]["label"] for m in markets or [] if m in MARKETS]
 

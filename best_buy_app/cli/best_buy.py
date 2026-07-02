@@ -14,6 +14,7 @@ from urllib.request import Request, urlopen
 
 from best_buy_app.core.config import load_config
 from best_buy_app.core.decision_engine import (
+    attach_relative_strength,
     buy_decision,
     classify_zone,
     confirmation_score,
@@ -29,7 +30,7 @@ from best_buy_app.core.decision_engine import (
     trade_plan,
 )
 from best_buy_app.core.indicators import analyze, refresh_last_kline
-from best_buy_app.core.market_hours import apply_calendar_overrides, describe_status, market_labels, market_status, markets_for_symbols
+from best_buy_app.core.market_hours import apply_calendar_overrides, describe_status, intraday_progress, market_for_symbol, market_labels, market_status, markets_for_symbols
 from best_buy_app.core.output_utils import CYAN, DIM, MAGENTA, RED, colorize, log_line, simple_table, supports_color, ts_now
 from best_buy_app.data import storage
 from best_buy_app.data.market_data import fetch_quote, load_rows, now_ts
@@ -49,7 +50,30 @@ def parse_leveraged(spec):
     return {"symbol": sym, "source": source, "ratio": ratio}
 
 
-def load_snapshot(symbol, range_="3mo", rows=None, quote=None):
+def build_intraday_ctx(market, vol_proj_cfg=None):
+    """根据盘中进度构建量能投影上下文。
+
+    午休(paused)期间 progress 冻结在已走完时段，仍返回可投影 ctx，避免量比断崖式跳变。
+    """
+    vol_proj_cfg = vol_proj_cfg or {}
+    if not vol_proj_cfg.get("enabled", True) or not market:
+        return None
+    prog = intraday_progress(market)
+    if not (prog["is_open"] or prog.get("paused")):
+        return None
+    return {
+        "is_open": True,
+        "paused": prog.get("paused", False),
+        "progress": prog["progress"],
+        "elapsed_minutes": prog["elapsed_minutes"],
+        "total_minutes": prog["total_minutes"],
+        "morning_cutoff_progress": vol_proj_cfg.get("morning_cutoff_progress", 0.5),
+        "morning_deflation": vol_proj_cfg.get("morning_deflation", 0.7),
+        "max_ratio": vol_proj_cfg.get("max_ratio", 3.0),
+    }
+
+
+def load_snapshot(symbol, range_="3mo", rows=None, quote=None, intraday_ctx=None):
     if rows is None:
         yc = load_rows(symbol, range_)
         rows = yc["rows"] if yc and yc.get("rows") else None
@@ -59,9 +83,11 @@ def load_snapshot(symbol, range_="3mo", rows=None, quote=None):
         quote = fetch_quote(symbol)
     if quote and quote.get("price") is not None:
         rows = refresh_last_kline(rows, quote["price"])
-    analysis = analyze(rows, symbol)
+    analysis = analyze(rows, symbol, intraday_ctx=intraday_ctx)
     if quote and quote.get("price") is not None:
         analysis["live_price"] = quote["price"]
+        if quote.get("change_pct") is not None:
+            analysis["change_pct"] = quote["change_pct"]
         if quote.get("timestamp"):
             analysis["live_timestamp"] = quote["timestamp"]
     return {"symbol": symbol, "quote": quote, "rows": rows, "analysis": analysis}
@@ -97,7 +123,7 @@ class SnapshotCache:
             return storage.fetch_quote_cached(self.cfg, symbol, ttl_seconds=self.quote_ttl)
         return fetch_quote(symbol)
 
-    def get(self, symbol, range_="3mo", force_rows=False, force_quote=False):
+    def get(self, symbol, range_="3mo", force_rows=False, force_quote=False, intraday_ctx=None):
         key = (symbol, range_)
         item = self._cache.get(key, {})
         now = now_ts()
@@ -106,7 +132,7 @@ class SnapshotCache:
         if force_rows or not rows_ok:
             rows = self._fetch_rows(symbol, range_)
             quote = self._fetch_quote(symbol)
-            snap = load_snapshot(symbol, range_, rows=rows, quote=quote)
+            snap = load_snapshot(symbol, range_, rows=rows, quote=quote, intraday_ctx=intraday_ctx)
             if snap:
                 item["snapshot"] = snap
                 item["rows_at"] = now
@@ -118,7 +144,7 @@ class SnapshotCache:
                 rows = item["snapshot"]["rows"]
                 if quote.get("price") is not None:
                     rows = refresh_last_kline(rows, quote["price"])
-                analysis = analyze(rows, symbol)
+                analysis = analyze(rows, symbol, intraday_ctx=intraday_ctx)
                 if quote.get("price") is not None:
                     analysis["live_price"] = quote["price"]
                     if quote.get("timestamp"):
@@ -227,7 +253,13 @@ def watch_mode(args, cfg):
         cfg=cfg,
     )
 
-    main_snapshot = cache.get(args.symbol, args.range, force_rows=True)
+    main_market = market_for_symbol(args.symbol)
+    vol_proj_cfg = effective_cfg.get("strategy", {}).get("volume_projection", {})
+
+    def _intraday_ctx_for(market):
+        return build_intraday_ctx(market, vol_proj_cfg)
+
+    main_snapshot = cache.get(args.symbol, args.range, force_rows=True, intraday_ctx=_intraday_ctx_for(main_market))
     if not main_snapshot:
         print(f"错误：无法获取 {args.symbol} 的K线数据", file=sys.stderr)
         sys.exit(1)
@@ -266,7 +298,15 @@ def watch_mode(args, cfg):
                     time.sleep(sleep_seconds)
                     continue
 
-            main_snapshot = cache.get(args.symbol, args.range) or main_snapshot
+            today = datetime.now().date()
+            if prev.get("last_date") and today != prev["last_date"]:
+                # 跨交易日：清空分时 Tick 队列，防止 Rebound/VWAP 把昨天切片算进今天
+                price_history.clear()
+                peer_price_histories.clear()
+                market_price_history.clear()
+                print(colorize(f"跨交易日 {prev['last_date']}→{today}，已重置分时队列", DIM, color))
+
+            main_snapshot = cache.get(args.symbol, args.range, intraday_ctx=_intraday_ctx_for(main_market)) or main_snapshot
             if has_lev:
                 lev_snapshot = cache.get(leverage_spec["symbol"], args.range) or lev_snapshot
             peer_snapshots = [peer_cache.get(sym, args.range) or snap for sym, snap in zip(peer_symbols, peer_snapshots + [None] * max(0, len(peer_symbols) - len(peer_snapshots)))]
@@ -280,10 +320,18 @@ def watch_mode(args, cfg):
             peer_analyses = [snap["analysis"] for snap in peer_snapshots]
             market_analysis = market_snapshot["analysis"] if market_snapshot else None
 
-            buy = buy_decision(main_analysis, effective_cfg)
             sell = sell_decision(main_analysis, effective_cfg)
             confirm = confirmation_score(main_analysis, peer_analyses, market_analysis, effective_cfg)
-            plan = trade_plan(main_analysis, confirm, effective_cfg)
+            main_analysis = attach_relative_strength(main_analysis, confirm)
+            buy = buy_decision(main_analysis, effective_cfg)
+            # 持仓状态：已持仓则刷新持仓以来最高价（单调非递减），传入 trade_plan 锚定吊灯止损。
+            # 未持仓时 position_highest=None，禁止用历史 swing_high 算伪吊灯止损踩踏开仓。
+            position_highest = None
+            pos = storage.get_position(cfg, primary_sym)
+            if pos and lp is not None:
+                pos = storage.update_position_peak(cfg, primary_sym, lp) or pos
+                position_highest = pos.get("highest_since_entry")
+            plan = trade_plan(main_analysis, confirm, effective_cfg, position_highest=position_highest)
             short_plan = short_term_plan(main_analysis, effective_cfg)
 
             lp = primary_analysis.get("close")
@@ -324,6 +372,31 @@ def watch_mode(args, cfg):
                 buy["signals"] = momentum["signals"] + buy.get("signals", [])
                 buy["score"] = max(buy.get("score", 0), 2)
             action = final_action_with_momentum(buy, sell, confirm, momentum, premomentum)
+
+            # 纸面仓位（Paper Trading）：信号触发即虚拟开仓并追踪持仓峰值，破止损或强卖出则平仓。
+            # 持仓状态只用于锚定吊灯止损，不接真实下单；外部实盘可用 storage.open_position(force=True) 覆写。
+            paper_cfg = effective_cfg.get("strategy", {}).get("paper_trading", {})
+            if paper_cfg.get("enabled", True) and lp is not None:
+                stop_loss = plan.get("stop_loss")
+                if pos:
+                    should_close = (
+                        (paper_cfg.get("close_on_stop_loss", True) and stop_loss is not None and lp <= stop_loss)
+                        or sell.get("score", 0) >= paper_cfg.get("close_sell_score", 3)
+                    )
+                    if should_close:
+                        storage.close_position(cfg, primary_sym)
+                        print(colorize(f"📒 纸面平仓 {primary_sym} @{lp}（止损={fmt_num(stop_loss)} 卖出分={sell.get('score', 0)}）", MAGENTA, color))
+                else:
+                    open_buy = paper_cfg.get("open_buy_score", 3)
+                    open_confirm = paper_cfg.get("open_confirm_score", 2)
+                    should_open = bool(
+                        momentum.get("active")
+                        or (buy.get("score", 0) >= open_buy and confirm.get("score", 0) >= open_confirm)
+                    )
+                    if should_open:
+                        opened = storage.open_position(cfg, primary_sym, lp)
+                        if opened:
+                            print(colorize(f"📒 纸面开仓 {primary_sym} @{lp}（买入分={buy.get('score', 0)} 确认分={confirm.get('score', 0)}）", MAGENTA, color))
 
             zone = classify_zone(primary_analysis, lp, buy, sell, momentum, premomentum)
 
@@ -442,6 +515,7 @@ def watch_mode(args, cfg):
                 "history": feed["history"],
                 "momentum_active": momentum.get("active"),
                 "premomentum_active": premomentum.get("active"),
+                "last_date": today,
             }
             time.sleep(interval)
     except KeyboardInterrupt:
@@ -496,9 +570,10 @@ def main():
     analysis = main_snapshot["analysis"]
     quote = main_snapshot["quote"]
     lev_analysis = lev_snapshot["analysis"] if lev_snapshot else None
-    buy = buy_decision(analysis, effective_cfg)
     sell = sell_decision(analysis, effective_cfg)
     confirm = confirmation_score(analysis, [p["analysis"] for p in peer_snapshots], market_snapshot["analysis"] if market_snapshot else None, effective_cfg)
+    analysis = attach_relative_strength(analysis, confirm)
+    buy = buy_decision(analysis, effective_cfg)
     plan = trade_plan(analysis, confirm, effective_cfg)
     action = final_action(buy, sell, confirm)
 

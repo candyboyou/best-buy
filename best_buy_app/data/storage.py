@@ -75,6 +75,26 @@ CREATE TABLE IF NOT EXISTS watchlist (
   added_at_text TEXT,
   active INTEGER DEFAULT 1
 );
+
+CREATE TABLE IF NOT EXISTS sentiment_scores (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts REAL NOT NULL,
+  ts_text TEXT,
+  symbol TEXT,
+  score INTEGER,
+  summary TEXT,
+  items TEXT,
+  payload TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_sentiment_symbol_ts ON sentiment_scores(symbol, ts);
+
+CREATE TABLE IF NOT EXISTS positions (
+  symbol TEXT PRIMARY KEY,
+  entry_price REAL NOT NULL,
+  highest_since_entry REAL NOT NULL,
+  opened_at REAL NOT NULL,
+  opened_at_text TEXT
+);
 """
 
 
@@ -344,6 +364,196 @@ def remove_watch(cfg, symbol):
     conn = connect(cfg)
     try:
         cur = conn.execute("DELETE FROM watchlist WHERE symbol=?", (symbol,))
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def record_sentiment(cfg, symbol, score, summary="", items=None, payload=None):
+    """记录一个 AI 情绪分，score 约定为 -5 到 +5。"""
+    init_db(cfg)
+    symbol = str(symbol).strip().upper()
+    stored_items = items or []
+    stored_payload = payload or {
+        "symbol": symbol,
+        "score": score,
+        "summary": summary,
+        "items": stored_items,
+    }
+    conn = connect(cfg)
+    try:
+        conn.execute(
+            """INSERT INTO sentiment_scores
+               (ts, ts_text, symbol, score, summary, items, payload)
+               VALUES (?,?,?,?,?,?,?)""",
+            (
+                time.time(),
+                ts_now(),
+                symbol,
+                score,
+                summary,
+                json.dumps(stored_items, ensure_ascii=False),
+                json.dumps(stored_payload, ensure_ascii=False),
+            ),
+        )
+    finally:
+        conn.close()
+
+
+def get_latest_sentiment(cfg, symbol, decay_hours=None, decay_floor=None):
+    """返回指定标的最新 AI 情绪分。
+
+    陈旧情绪按指数衰减：effective = raw * 0.5 ** (elapsed_hours / decay_hours)。
+    |effective| < decay_floor 时截断归零，避免残留噪音长期污染 RSI 缓冲区。
+    score 字段保留原始值（向后兼容）；新增 raw_score/effective_score/decayed。
+    """
+    init_db(cfg)
+    symbol = str(symbol).strip().upper()
+    conn = connect(cfg)
+    try:
+        row = conn.execute(
+            """SELECT ts, ts_text, symbol, score, summary, items, payload
+               FROM sentiment_scores
+               WHERE symbol=?
+               ORDER BY ts DESC
+               LIMIT 1""",
+            (symbol,),
+        ).fetchone()
+        if not row:
+            return None
+        item = _as_dict(row)
+        try:
+            item["items"] = json.loads(item.get("items") or "[]")
+        except (TypeError, ValueError):
+            item["items"] = []
+        try:
+            item["payload"] = json.loads(item.get("payload") or "{}")
+        except (TypeError, ValueError):
+            item["payload"] = {}
+
+        sa_cfg = ((cfg.get("strategy", {}) or {}) if isinstance(cfg, dict) else {}).get("sentiment_alpha", {}) or {}
+        dh = decay_hours if decay_hours is not None else sa_cfg.get("decay_hours", 12)
+        floor = decay_floor if decay_floor is not None else sa_cfg.get("decay_floor", 0.5)
+        raw_score = item.get("score")
+        item["raw_score"] = raw_score
+        if raw_score is None:
+            item["effective_score"] = None
+            item["decayed"] = False
+        else:
+            elapsed_hours = (time.time() - item["ts"]) / 3600
+            effective = raw_score * (0.5 ** (elapsed_hours / dh)) if dh and dh > 0 else raw_score
+            decayed = abs(effective) < floor
+            item["effective_score"] = 0 if decayed else round(effective, 3)
+            item["decayed"] = decayed
+        return item
+    finally:
+        conn.close()
+
+
+def _normalize_symbol(symbol):
+    return str(symbol or "").strip().upper()
+
+
+def get_position(cfg, symbol):
+    """返回纸面/实盘持仓 dict，无持仓返回 None。
+
+    字段：symbol / entry_price / highest_since_entry / opened_at / opened_at_text。
+    highest_since_entry 由 update_position_peak 单调非递减维护，供吊灯止损锚定。
+    """
+    init_db(cfg)
+    symbol = _normalize_symbol(symbol)
+    if not symbol:
+        return None
+    conn = connect(cfg)
+    try:
+        row = conn.execute(
+            """SELECT symbol, entry_price, highest_since_entry, opened_at, opened_at_text
+               FROM positions WHERE symbol=?""",
+            (symbol,),
+        ).fetchone()
+        return _as_dict(row)
+    finally:
+        conn.close()
+
+
+def open_position(cfg, symbol, price, force=False):
+    """建立持仓。force=False（默认，纸面自动开仓）时已存在则保留既有 entry/峰值不覆盖；
+    force=True（外部实盘同步）时强制覆写为给定 price。返回写入后的持仓 dict。
+    """
+    init_db(cfg)
+    symbol = _normalize_symbol(symbol)
+    if not symbol:
+        raise ValueError("symbol is required")
+    if price is None:
+        raise ValueError("price is required")
+    now = time.time()
+    conn = connect(cfg)
+    try:
+        conn.execute("BEGIN")
+        if force:
+            conn.execute(
+                """INSERT INTO positions (symbol, entry_price, highest_since_entry, opened_at, opened_at_text)
+                   VALUES (?,?,?,?,?)
+                   ON CONFLICT(symbol) DO UPDATE SET
+                     entry_price=excluded.entry_price,
+                     highest_since_entry=excluded.highest_since_entry,
+                     opened_at=excluded.opened_at,
+                     opened_at_text=excluded.opened_at_text""",
+                (symbol, price, price, now, ts_now()),
+            )
+        else:
+            # 仅在不存在时插入；已存在则不动既有 entry 与峰值
+            conn.execute(
+                """INSERT INTO positions (symbol, entry_price, highest_since_entry, opened_at, opened_at_text)
+                   VALUES (?,?,?,?,?)
+                   ON CONFLICT(symbol) DO NOTHING""",
+                (symbol, price, price, now, ts_now()),
+            )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+    return get_position(cfg, symbol)
+
+
+def update_position_peak(cfg, symbol, current_price):
+    """以 max(highest_since_entry, current_price) 更新持仓峰值，单调非递减。
+
+    无持仓时返回 None（不自动开仓）。返回更新后的持仓 dict。
+    """
+    init_db(cfg)
+    symbol = _normalize_symbol(symbol)
+    if not symbol or current_price is None:
+        return get_position(cfg, symbol)
+    conn = connect(cfg)
+    try:
+        conn.execute("BEGIN")
+        cur = conn.execute(
+            """UPDATE positions
+               SET highest_since_entry = MAX(highest_since_entry, ?)
+               WHERE symbol=?""",
+            (current_price, symbol),
+        )
+        conn.execute("COMMIT")
+        if cur.rowcount == 0:
+            return None
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+    return get_position(cfg, symbol)
+
+
+def close_position(cfg, symbol):
+    """虚拟平仓，删除持仓记录。返回是否删除了一行。"""
+    init_db(cfg)
+    symbol = _normalize_symbol(symbol)
+    conn = connect(cfg)
+    try:
+        cur = conn.execute("DELETE FROM positions WHERE symbol=?", (symbol,))
         return cur.rowcount > 0
     finally:
         conn.close()

@@ -8,6 +8,7 @@ import os
 import re
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from urllib.error import HTTPError
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -18,7 +19,9 @@ from urllib.request import Request, urlopen
 
 from best_buy_app.core.config import load_config
 from best_buy_app.core.decision_engine import (
+    attach_relative_strength,
     buy_decision,
+    buy_decision_mtfa,
     classify_zone,
     confirmation_score,
     final_action,
@@ -26,7 +29,7 @@ from best_buy_app.core.decision_engine import (
     short_term_plan,
     trade_plan,
 )
-from best_buy_app.core.indicators import analyze, refresh_last_kline
+from best_buy_app.core.indicators import analyze, analyze_timeframes, refresh_last_kline, vwap
 from best_buy_app.core.output_utils import ts_now
 from best_buy_app.data.global_stock_data import calc_boll, calc_kdj, calc_ma, calc_macd, calc_rsi, intraday_swing_summary, stock_kline, stock_quote, stock_search
 from best_buy_app.data.market_data import fetch_quote, load_rows
@@ -36,49 +39,56 @@ from best_buy_app.data.news_aggregator import compact_news_for_ai, fetch_news
 
 ROOT = Path(__file__).resolve().parents[2]
 DASHBOARD_DIR = ROOT / "dashboard"
-AI_INSTRUCTIONS = """你是股票监控助手。结合给定监控数据直接回答用户问题；不要复述用户问题，不要逐条复述上下文。可以回答短线、仓位、买卖点、风险、相关股票影响等金融问题；不承诺收益，不编造不存在的数据。
+AI_INSTRUCTIONS = """你是一位深耕全球半导体与存储芯片板块（HK/US/KR）的顶级量化交易员兼首席操盘策略师。
+请结合实时流入的监控上下文，以极度专业、凝练、具有强行动导向的语气直接回答交易员的问题。
 
-你还可以参考本项目已接入的 global-stock-data 能力说明：
-- 美股/港股实时行情：新浪、腾讯、东财 push2，可拿 open/high/low/price/prev_close/change_pct/volume。
-- K 线：美股优先新浪日 K，Yahoo chart 可取美股和港股日/周/月/分钟 K 线；港股 K 线优先 Yahoo。
-- 技术指标：基于 K 线可计算 MA/EMA、MACD、RSI、KDJ、布林带。
-- 资金流/财报/指标：东财 datacenter、东财 push2his、Yahoo quoteSummary、SEC EDGAR 可用于更深层分析。
-- 股票搜索：东财 search 可把中文名或 ticker 映射到市场代码。
+【核心量化指标解读单调性铁律】
+上下文中包含了系统手写规则引擎计算出的最新指标切片，你必须将其视作唯一的交易底色：
+1. `buy_score` / `sell_score`: 代表左侧指标超买超卖与形态的打分（0-6分）。
+2. `confirm_score`: 全球趋势环境确认分。≥3 说明韩股（海力士/三星）与美股多头共振，大环境顺风，阻力变薄。
+3. `zone` & `action`: 系统最终锁定的盘口区间与动作结论（如：🟢买点区、🟡支撑观察、🟢预动量、可分批试探等）。
+4. `short_entries` / `short_exits`: 精确的近端回踩买点与分批阻力卖点。
+5. `short_stop`: 动态风控止损线。这是结合纸面仓位（Paper Trading）与持仓最高价（position_highest）单调非递减维护的终极防线，一旦破位将无条件止损。
 
-回答规则：
-- 如果当前上下文已经提供了 open/high/low/close，就先总结当天开高低收、涨跌幅、量能、支撑阻力和风险；只有用户明确要求分时/盘中波段时，才统计每波涨跌。
-- 如果上下文只有收盘价、MA20、RSI 或监控摘要，不要说“无法回答”后结束；应明确指出缺少的最小数据，并说明可用 Yahoo chart/新浪/腾讯/东财补充。
-- 对“分时”“盘中”“几波涨跌”“每波百分比”这类问题，优先要求或使用对应交易日的分钟 K 线；只有日线 OHLC 时，只能计算相对开盘价的最高涨幅和最低跌幅，不能精确统计每一波。普通“今天行情总结”不要默认要求波段统计。
-- 不要编造未提供、未查询到的数据。"""
+你必须熟练运用量化交易黑话（如：“右侧动量确立”、“左侧超卖接刀”、“多周期共振破位”、“锁盈防守线上移”等）来包装这些数据，给出精确具体的操盘路径，绝不能给出与系统 Action 矛盾的废话。
 
-TOOL_DECIDER = """你要决定用户问题是否需要调用本地工具。
+【回答与输出排版规范】
+- 严禁废话：拒绝复述用户问题，拒绝机械地逐条罗列原始 JSON 字段。直接切中买卖要害。
+- 必须使用 Markdown 结构化排版，关键价位用 **加粗** 强调。
+- 谈及买入时，需检查量比（`volume_ratio`）警惕缩量假突破；谈及风险时，必须明确给出系统的止损防守价（`short_stop`）。
+
+【输出排版模版】
+### 📊 芯片板块盘口定调：[一句话说清当前标的多空状态与核心区间]
+- **操盘核心策略**：[例如：多周期共振回踩，支撑位左侧分批吸纳 / 动量已扩展，谨慎追高]
+- **量化引擎支撑**：盘口区间为 **{zone}**，最终动作 **{action}**（买入分 **{buy_score}** / 确认分 **{confirm_score}**）。[一两句硬核技术面/全球联动面点评]
+- **精细化操盘路线图**：
+  - 📍 理想买位：**[提取 short_entries 中的关键价位]**
+  - 🛑 铁律防守：**{short_stop}** [触及此线纸面持仓将自动无条件清仓卖出]
+  - 🎯 分批止盈：**[提取 resistances 或 short_exits 中的前两个目标阻力价]**"""
+
+TOOL_DECIDER = """你要决定用户问题是否需要调用本地工具（global_stock_data 或 news_aggregator）进行上下文补充。
 
 可用工具 1: global_stock_data
-- quote: 美股/港股实时行情，含 open/high/low/price/prev_close/change_pct/volume。
-- kline: Yahoo/新浪 K 线，支持 1d/5m/15m/1h 等。
-- indicators: 基于 K 线计算 MA/MACD/RSI/KDJ/布林带。
-- intraday_swings: 基于分钟 K 线统计盘中最高/最低、相对开盘涨跌幅、涨跌波段。
+- quote: 实时行情，含 open/high/low/price/change_pct/volume。
+- kline: K线时序数据，支持 1d/5m/15m 等。
+- indicators: MA/MACD/RSI/KDJ/布林带。
+- intraday_swings: 基于分钟 K 线统计盘中波段与多波震荡幅度。
 
 可用工具 2: news_aggregator
-- sources: international, finance, tech, ai, ai_newsletters, chinese, hackernews, github_trending, wallstreetcn, weibo, bbc_world, reuters 等。
-- keyword: 关键词过滤；用户问 AI 新闻时可用 "AI"，会自动扩展到 LLM/GPT/Claude/Agent/RAG/DeepSeek。
-- limit: 返回新闻数量。
+- sources: finance, international, tech, ai, wallstreetcn, weibo 等。
+- keyword: 过滤关键词（若用户问 AI 新闻可用 "AI"，自动扩展）。
+- limit: 限制条数（1-20）。
 
-只返回 JSON，不要解释。格式：
-{
-  "global_stock_data": {"use_tool": true, "symbols": ["MU"], "data": ["quote", "kline", "intraday_swings"], "interval": "5m", "range": "5d", "reason": "用户询问昨天盘中波段"},
-  "news_aggregator": {"use_tool": true, "sources": ["finance"], "keyword": "美股,半导体", "limit": 8, "reason": "用户询问相关新闻"}
-}
+只返回纯净的单行 JSON，绝对不要包含任何多余的 Markdown 标记、反引号、或自然语言解释。
 
-判断规则：
-- 用户问行情、价格、涨跌、最高、最低、开盘、收盘、K线、分时、盘中、昨天/今天走势、技术指标、财报、资金流时，use_tool=true。
-- 用户只问“现在能买吗/止损放哪/仓位怎么做”，且当前监控上下文已足够，use_tool=false。
-- 没有明确股票代码时，可以使用当前监控标的 symbol；如果用户提到 peers/美股/相关股票，也可选上下文里的相关 symbol。
-- 问“分时/盘中/几波涨跌/每波百分比/波段”时，data 必须包含 intraday_swings，interval 用 5m，range 用 5d 或 1d；普通“今天行情总结”使用 quote、日线 kline 和 indicators。
-- 问技术指标时，data 包含 kline 和 indicators，interval 用 1d，range 用 6mo。
-- 用户问新闻、资讯、消息面、热点、早报、日报、国际新闻、科技新闻、财经新闻、AI新闻、微博热搜、GitHub趋势、Hacker News 时，news_aggregator.use_tool=true。
-- 股票相关“有什么新闻/消息面/利好利空/影响”可同时调用 news_aggregator 和 global_stock_data。
-- symbols 最多 4 个。"""
+【意图判断红线】
+1. 问行情变动、价格、最高最低、分时走势、盘中几波涨跌、技术指标线、消息面利好利空时，use_tool=true。
+2. 只问持仓止损怎么放、当前能不能买，且当前默认监控上下文已经足够完整，use_tool=false。
+3. 问“盘中几波涨跌/每波百分比”时，data 必须包含 "intraday_swings"，interval 固定用 "5m"，range 固定用 "5d"。
+4. 问宏观消息、利好利空、行业资讯时，news_aggregator.use_tool=true。
+
+输出格式示例：
+{"global_stock_data": {"use_tool": true, "symbols": ["MU"], "data": ["quote", "kline", "intraday_swings"], "interval": "5m", "range": "5d", "reason": "用户询问昨天盘中波段"}, "news_aggregator": {"use_tool": false}}"""
 
 
 def _parse_int(value, default, maximum=None):
@@ -146,17 +156,92 @@ def load_symbol_snapshot(symbol, range_="3mo"):
     analysis = analyze(rows, symbol)
     if quote and quote.get("price") is not None:
         analysis["live_price"] = quote["price"]
+        if quote.get("change_pct") is not None:
+            analysis["change_pct"] = quote["change_pct"]
         if quote.get("timestamp"):
             analysis["live_timestamp"] = quote["timestamp"]
     return {"symbol": symbol, "quote": quote, "rows": rows, "analysis": analysis}
 
 
+# 短 TTL 内存缓存：避免每 4s 前端轮询都重拉 yahoo intraday K线 / 重算 peer 快照
+_mem_cache = {}
+_mem_cache_lock = threading.Lock()
+
+
+def _ttl_cache_get(namespace, key, range_=None):
+    ck = (namespace, key, range_)
+    item = _mem_cache.get(ck)
+    if item and (time.time() - item[0]) < item[2]:
+        return item[1]
+    return None
+
+
+def _ttl_cache_set(namespace, key, value, ttl, range_=None):
+    ck = (namespace, key, range_)
+    with _mem_cache_lock:
+        # 顺手清理过期项，避免无限膨胀
+        if len(_mem_cache) > 256:
+            now = time.time()
+            for k in list(_mem_cache.keys()):
+                v = _mem_cache[k]
+                if (now - v[0]) >= v[2]:
+                    _mem_cache.pop(k, None)
+        _mem_cache[ck] = (time.time(), value, ttl)
+
+
+def load_intraday_analysis(symbol):
+    cached = _ttl_cache_get("intraday_analysis", symbol)
+    if cached is not None:
+        return cached
+    rows_by_timeframe = {}
+    for timeframe in ("60m", "15m"):
+        try:
+            data = stock_kline(symbol, interval=timeframe, range_="5d", limit=120)
+        except Exception:
+            data = None
+        rows = (data or {}).get("rows") or []
+        if rows:
+            rows_by_timeframe[timeframe] = rows
+    result = analyze_timeframes(rows_by_timeframe, symbol) if rows_by_timeframe else {}
+    _ttl_cache_set("intraday_analysis", symbol, result, ttl=20)
+    return result
+
+
+def load_intraday_vwap(symbol):
+    cached = _ttl_cache_get("intraday_vwap", symbol)
+    if cached is not None:
+        return cached
+    try:
+        data = stock_kline(symbol, interval="5m", range_="1d", limit=96)
+    except Exception:
+        return None
+    rows = (data or {}).get("rows") or []
+    value = vwap(rows)
+    result = {"vwap": value, "rows": len(rows)} if value is not None else None
+    _ttl_cache_set("intraday_vwap", symbol, result, ttl=20)
+    return result
+
+
 def load_related_snapshots(symbols, range_="3mo", limit=8):
+    targets = (symbols or [])[:limit]
+    if not targets:
+        return []
+    cached = _ttl_cache_get("related_snapshots", tuple(targets), range_)
+    if cached is not None:
+        return cached
+
+    def _safe_snap(sym):
+        try:
+            return load_symbol_snapshot(sym, range_)
+        except Exception:
+            return None
+
     snapshots = []
-    for symbol in (symbols or [])[:limit]:
-        snap = load_symbol_snapshot(symbol, range_)
-        if snap:
-            snapshots.append(snap)
+    with ThreadPoolExecutor(max_workers=min(8, len(targets))) as pool:
+        for snap in pool.map(_safe_snap, targets):
+            if snap:
+                snapshots.append(snap)
+    _ttl_cache_set("related_snapshots", tuple(targets), snapshots, ttl=8, range_=range_)
     return snapshots
 
 
@@ -173,12 +258,31 @@ def build_stock_feed(symbol, cfg, history=None, range_="3mo"):
     market_snapshot = load_symbol_snapshot(market_symbols[0], range_) if market_symbols else None
 
     analysis = main_snapshot["analysis"]
+    intraday_analyses = load_intraday_analysis(symbol) if cfg.get("strategy", {}).get("mtfa", {}).get("enabled", True) else {}
+    intraday_vwap = load_intraday_vwap(symbol)
+    if intraday_vwap:
+        analysis = dict(analysis)
+        analysis["intraday"] = intraday_vwap
+    sentiment = storage.get_latest_sentiment(cfg, symbol)
+    if sentiment and cfg.get("strategy", {}).get("sentiment_alpha", {}).get("enabled", True):
+        analysis = dict(analysis)
+        analysis["sentiment"] = sentiment
     peer_analyses = [item["analysis"] for item in peer_snapshots]
     market_analysis = market_snapshot["analysis"] if market_snapshot else None
-    buy = buy_decision(analysis, cfg)
     sell = sell_decision(analysis, cfg)
     confirm = confirmation_score(analysis, peer_analyses, market_analysis, cfg)
-    plan = trade_plan(analysis, confirm, cfg)
+    analysis = attach_relative_strength(analysis, confirm)
+    mtfa_analyses = {"1d": analysis}
+    mtfa_analyses.update(intraday_analyses)
+    buy = buy_decision_mtfa(mtfa_analyses, cfg) if intraday_analyses else buy_decision(analysis, cfg)
+    # 持仓状态只读传入：dashboard 不自动开平仓，仅用持仓峰值锚定吊灯止损展示。
+    pos = storage.get_position(cfg, symbol)
+    position_highest = None
+    live_price = analysis.get("close")
+    if pos and live_price is not None:
+        pos = storage.update_position_peak(cfg, symbol, live_price) or pos
+        position_highest = pos.get("highest_since_entry")
+    plan = trade_plan(analysis, confirm, cfg, position_highest=position_highest)
     short_plan = short_term_plan(analysis, cfg)
     plan["short_term"] = short_plan
     price = analysis.get("close")
@@ -208,6 +312,13 @@ def build_stock_feed(symbol, cfg, history=None, range_="3mo"):
             "source": quote.get("source"),
             "timestamp": quote.get("timestamp"),
         },
+        "position": {
+            "symbol": pos.get("symbol") if pos else None,
+            "entry_price": pos.get("entry_price") if pos else None,
+            "highest_since_entry": pos.get("highest_since_entry") if pos else None,
+            "opened_at": pos.get("opened_at") if pos else None,
+            "opened_at_text": pos.get("opened_at_text") if pos else None,
+        } if pos else None,
         "zone": zone,
         "action": action,
         "confirm_score": confirm["score"],
@@ -226,8 +337,18 @@ def build_stock_feed(symbol, cfg, history=None, range_="3mo"):
             "ma20": analysis.get("ma", {}).get(20),
             "supports": analysis.get("supports", []),
             "resistances": analysis.get("resistances", []),
+            "analyses": mtfa_analyses,
+            "intraday": analysis.get("intraday"),
+            "sentiment": analysis.get("sentiment"),
             "short_term": short_plan,
             "plan": plan,
+            "position": {
+                "symbol": pos.get("symbol") if pos else None,
+                "entry_price": pos.get("entry_price") if pos else None,
+                "highest_since_entry": pos.get("highest_since_entry") if pos else None,
+                "opened_at": pos.get("opened_at") if pos else None,
+                "opened_at_text": pos.get("opened_at_text") if pos else None,
+            } if pos else None,
             "market": {
                 "symbol": market_snapshot["symbol"],
                 "label": market_analysis.get("label"),
@@ -261,7 +382,11 @@ def json_response(handler, status, payload, cache=False):
         handler.send_header("Expires", "0")
     handler.send_header("Content-Length", str(len(body)))
     handler.end_headers()
-    handler.wfile.write(body)
+    try:
+        handler.wfile.write(body)
+    except (BrokenPipeError, ConnectionResetError):
+        # 客户端在响应写完前已关闭连接（如轮询被取消、页面刷新），属正常情况，忽略即可
+        pass
 
 
 def compact_levels(levels, limit=4):

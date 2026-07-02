@@ -3,7 +3,9 @@
 
 from best_buy_app.core.decision_report import render_report, render_watch_tick
 from best_buy_app.core.decision_rules import (
+    attach_relative_strength,
     buy_decision,
+    buy_decision_mtfa,
     classify_zone,
     confirmation_score,
     final_action,
@@ -16,4 +18,3 @@ from best_buy_app.core.decision_rules import (
     short_term_plan,
     trade_plan,
 )
-

@@ -2,8 +2,8 @@
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>best-buy 监控面板</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+  <title>best-buy 超短线战术 HUD</title>
   <link rel="stylesheet" href="./styles.css" />
 </head>
 <body>
@@ -28,96 +28,161 @@
     </section>
 
     <section class="tab-page active" id="tab-monitor">
-      <section class="ticker-strip">
-        <div>
-          <div class="muted">标的</div>
-          <div class="ticker-main"><span id="symbol">07709</span><strong id="price">--</strong></div>
-        </div>
-        <div>
-          <div class="muted">区间</div>
-          <strong id="zone">--</strong>
-        </div>
-        <div>
-          <div class="muted">动作</div>
-          <strong id="action">--</strong>
-        </div>
-        <div>
-          <div class="muted">确认分</div>
-          <strong id="confirm">--</strong>
-        </div>
-        <div>
-          <div class="muted">更新时间</div>
-          <strong id="meta">等待数据</strong>
-        </div>
-      </section>
-
-      <section class="panel short-panel">
-        <div class="panel-head"><h2>短线操作</h2><span class="muted" id="shortNote">--</span></div>
-        <div class="short-grid">
-          <div>
-            <div class="short-label">短线买点</div>
-            <div class="pill-list" id="shortEntries"></div>
+      <div class="monitor-stack">
+        <section class="ticker-strip">
+          <div class="ticker-compat" aria-hidden="true">
+            <div class="muted">标的</div>
+            <span id="symbol">07709</span>
           </div>
           <div>
-            <div class="short-label">短线卖点</div>
-            <div class="pill-list" id="shortExits"></div>
+            <div class="muted">现价</div>
+            <strong id="price">--</strong>
           </div>
           <div>
-            <div class="short-label">短线止损</div>
-            <strong class="stop-price" id="shortStop">--</strong>
+            <div class="muted">区间</div>
+            <strong id="zone">--</strong>
           </div>
-        </div>
-      </section>
-
-      <section class="grid-main">
-        <details class="panel decision-panel compact-details">
-          <summary>
-            <span>核心判断</span>
-            <strong id="decisionSummary">--</strong>
-            <em id="updatedAt">--</em>
-          </summary>
-          <div class="decision-list details-body">
-            <div class="decision-row"><span>买</span><strong id="buyText">--</strong><em id="ma20Text">--</em></div>
-            <div class="decision-row"><span>卖</span><strong id="sellText">--</strong></div>
-            <div class="decision-row"><span>确认</span><strong id="confirmText">--</strong></div>
-            <div class="decision-row"><span>预动量</span><strong id="premomentumText">--</strong></div>
-            <div class="decision-row"><span>动量</span><strong id="momentumText">--</strong></div>
-            <div class="decision-row"><span>备注</span><strong id="noteText">--</strong></div>
+          <div>
+            <div class="muted">动作</div>
+            <strong id="action">--</strong>
           </div>
-        </details>
+          <div>
+            <div class="muted">更新时间</div>
+            <strong id="meta">等待数据</strong>
+          </div>
+        </section>
 
-        <article class="panel levels-panel">
-          <div class="levels-grid">
-            <div>
-              <div class="panel-head"><h2>深回撤备用</h2></div>
-              <div class="level-list" id="supports"></div>
-              <div class="batch-line"><span>备用价位</span><strong id="buyLevels">--</strong></div>
+        <section class="panel decision-command-strip" aria-label="核心决策指挥横条">
+          <span class="command-label">核心决策指挥横条</span>
+          <strong id="commandText" class="info">--</strong>
+        </section>
+
+        <section class="panel position-blood-hud" id="positionHud">
+          <div class="panel-head">
+            <h2>虚拟纸面持仓安全线</h2>
+            <span class="muted">Paper Trading HUD 动态生命血条</span>
+          </div>
+          <div class="life-bar-row" aria-label="止损到现价安全缓冲">
+            <div class="life-bar-endpoint stop-endpoint">
+              <span>止损</span>
+              <strong id="hudStopPrice">--</strong>
             </div>
-            <div>
-              <div class="panel-head"><h2>阻力 / 卖点</h2></div>
-              <div class="level-list" id="resistances"></div>
-              <div class="batch-line"><span>分批卖点</span><strong id="sellLevels">--</strong></div>
+            <div class="life-bar-track">
+              <div class="life-bar-fill" id="stopLossBloodBar" style="width: 100%"></div>
+            </div>
+            <div class="life-bar-endpoint price-endpoint">
+              <strong id="hudCurrentPrice">--</strong>
+              <span>现价</span>
             </div>
           </div>
-        </article>
-      </section>
+        </section>
 
-      <section class="grid-secondary">
-        <article class="panel">
-          <div class="panel-head"><h2>参照对象</h2></div>
-          <div id="refs" class="refs"></div>
+        <section class="panel short-panel">
+          <div class="panel-head"><h2>短线操作</h2><span class="muted" id="shortNote">--</span></div>
+          <section class="execution-map-hud" aria-label="超短线精密操盘矩阵">
+            <div class="exec-col">
+              <div class="exec-head">📍 理想买位 (等距分批接飞刀)</div>
+              <div class="pill-vertical-list" id="shortEntries"></div>
+            </div>
+            <div class="exec-col">
+              <div class="exec-head">🎯 目标阻力 (阶梯分批吃肉点)</div>
+              <div class="pill-vertical-list" id="shortExits"></div>
+            </div>
+          </section>
+          <div class="short-risk-band">
+            <span>🚨 短线风控防守</span>
+            <strong id="shortStop">--</strong>
+          </div>
+        </section>
+
+        <section class="panel remote-level-strip" aria-label="远端支撑与止盈">
+          <div class="remote-level-box">
+            <span>远端备用支撑</span>
+            <div class="remote-level-values" id="remoteSupports">--</div>
+          </div>
+          <div class="remote-level-box">
+            <span>远端分批止盈</span>
+            <div class="remote-level-values" id="remoteExits">--</div>
+          </div>
+        </section>
+
+        <article class="panel levels-panel deep-support-panel">
+          <div class="panel-head"><h2>深回撤备用</h2></div>
+          <div class="level-list" id="supports"></div>
         </article>
-        <article class="panel">
-          <div class="panel-head"><h2>最近监控记录</h2></div>
-          <div id="feed" class="feed"></div>
-        </article>
-      </section>
+
+        <section class="grid-main">
+          <article class="panel decision-panel">
+            <div class="panel-head"><h2>因子得分拆解</h2></div>
+            <div class="decision-audit-panel">
+              <div class="decision-audit-grid">
+                <div class="audit-row">
+                  <span>买入因子</span>
+                  <strong id="auditBuyScore">--</strong>
+                  <em id="auditBuyNote">--</em>
+                </div>
+                <div class="audit-row">
+                  <span>卖出因子</span>
+                  <strong id="auditSellScore">--</strong>
+                  <em id="auditSellNote">--</em>
+                </div>
+                <div class="audit-row">
+                  <span>趋势确认</span>
+                  <strong id="auditConfirmScore">--</strong>
+                  <em id="auditConfirmNote">--</em>
+                </div>
+                <div class="audit-row">
+                  <span>跨境联动</span>
+                  <strong id="auditPremomentumScore">--</strong>
+                  <em id="auditPremomentumNote">--</em>
+                </div>
+                <div class="audit-row">
+                  <span>盘中动量</span>
+                  <strong id="auditMomentumScore">--</strong>
+                  <em id="auditMomentumNote">--</em>
+                </div>
+              </div>
+              <div class="audit-notes">
+                <div class="audit-notes-title">战术操盘审计备注</div>
+                <p id="auditNote">--</p>
+              </div>
+            </div>
+          </article>
+
+          <article class="panel levels-panel resistance-panel">
+            <div class="panel-head"><h2>阻力 / 卖点</h2></div>
+            <div class="level-list" id="resistances"></div>
+          </article>
+        </section>
+
+        <section class="panel cabin-drawer-hud">
+          <div class="drawer-tabs">
+            <button class="drawer-tab active" type="button" id="tabTriggerRefs">📡 先导矩阵</button>
+            <button class="drawer-tab" type="button" id="tabTriggerEvents">📋 监控事件</button>
+          </div>
+          <div class="drawer-content active" id="cabin-refs">
+            <div id="refs" class="refs-hud-list"></div>
+          </div>
+          <div class="drawer-content" id="cabin-events">
+            <div id="feed" class="events-hud-list"></div>
+          </div>
+        </section>
+      </div>
     </section>
 
-    <section class="tab-page" id="tab-ai">
-      <section class="ai-layout">
+    <section class="tab-page ai-fullscreen" id="tab-ai" aria-hidden="true">
+      <div class="ai-fullscreen-shell">
+        <header class="ai-fullscreen-topbar">
+          <button type="button" class="back-btn" id="closeAiDrawer" aria-label="返回主页">← 返回</button>
+          <div class="ai-fullscreen-title">
+            <h2>问 AI</h2>
+            <p id="aiContextSummary">--</p>
+          </div>
+          <div class="ai-fullscreen-spacer" aria-hidden="true"></div>
+        </header>
+        <section class="ai-layout ai-fullscreen-body">
         <details class="panel context-panel compact-details">
-          <summary><span>当前上下文</span><strong id="aiContextSummary">--</strong></summary>
+          <summary><span>当前上下文</span><strong>--</strong></summary>
           <div id="aiContext" class="context-list details-body"></div>
         </details>
         <section class="panel chat-panel">
@@ -132,9 +197,15 @@
             <button type="submit">发送</button>
           </form>
         </section>
-      </section>
+        </section>
+      </div>
     </section>
   </main>
+
+  <button type="button" class="ai-fab-btn" id="tacticalAiFabTrigger" aria-label="唤起战术AI">
+    <span class="ai-fab-icon">🤖</span>
+    <span class="ai-fab-text">问AI</span>
+  </button>
 
   <div class="modal-backdrop" id="stockModal" hidden>
     <section class="modal" role="dialog" aria-modal="true" aria-labelledby="stockModalTitle">
@@ -151,6 +222,8 @@
     </section>
   </div>
 
+  <script src="./vendor/marked.min.js"></script>
+  <script src="./vendor/purify.min.js"></script>
   <script src="./app.js"></script>
 </body>
 </html>

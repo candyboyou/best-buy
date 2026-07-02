@@ -33,6 +33,71 @@ def _history_pct(history, lookback):
     return (current / base - 1) * 100
 
 
+def analysis_change_pct(analysis):
+    if not analysis or "error" in analysis:
+        return None
+    if analysis.get("change_pct") is not None:
+        return analysis.get("change_pct")
+    recent = [r for r in analysis.get("recent", []) if r.get("close") is not None]
+    if len(recent) < 2:
+        return None
+    base = recent[-2]["close"]
+    current = recent[-1]["close"]
+    if not base:
+        return None
+    return round((current / base - 1) * 100, 2)
+
+
+def attach_relative_strength(analysis, confirmation):
+    if not analysis:
+        return analysis
+    enriched = dict(analysis)
+    rs = (confirmation or {}).get("relative_strength")
+    if rs:
+        enriched["relative_strength"] = rs
+    return enriched
+
+
+def sentiment_adjustments(sentiment, cfg=None):
+    cfg = cfg or {}
+    raw = sentiment or {}
+    # 优先用衰减后的 effective_score（来自 storage 层指数衰减），缺失则回退原始 score
+    score = raw.get("effective_score")
+    if score is None:
+        score = raw.get("score")
+    adjustments = {"rsi_buy_delta": 0, "momentum_chase_limit_delta": 0}
+    if score is None:
+        return adjustments
+    if score >= cfg.get("positive_score", 3):
+        adjustments["rsi_buy_delta"] = cfg.get("rsi_buy_relax", 5)
+    if score <= cfg.get("negative_score", -3):
+        adjustments["momentum_chase_limit_delta"] = -abs(cfg.get("chase_limit_tighten_pct", 1.0))
+    return adjustments
+
+
+def apply_sentiment_adjustments(cfg, sentiment):
+    if not cfg:
+        cfg = {}
+    adjusted = {
+        key: (dict(value) if isinstance(value, dict) else value)
+        for key, value in cfg.items()
+    }
+    strategy = dict(adjusted.get("strategy", {}))
+    sentiment_cfg = strategy.get("sentiment_alpha", {})
+    adj = sentiment_adjustments(sentiment, sentiment_cfg)
+    if adj["rsi_buy_delta"]:
+        strategy["rsi_buy"] = strategy.get("rsi_buy", 30) + adj["rsi_buy_delta"]
+    if adj["momentum_chase_limit_delta"]:
+        momentum = dict(strategy.get("momentum", {}))
+        momentum["chase_limit_pct"] = max(
+            0,
+            momentum.get("chase_limit_pct", 4.0) + adj["momentum_chase_limit_delta"],
+        )
+        strategy["momentum"] = momentum
+    adjusted["strategy"] = strategy
+    return adjusted
+
+
 def _empty_premomentum(verdict, active=False):
     return {
         "signals": [],
@@ -44,10 +109,46 @@ def _empty_premomentum(verdict, active=False):
     }
 
 
+def _clamp(value, min_value=None, max_value=None):
+    if min_value is not None:
+        value = max(value, min_value)
+    if max_value is not None:
+        value = min(value, max_value)
+    return value
+
+
+def _adaptive_zone_settings(analysis, st):
+    zone_buffer = st.get("buy_zone_buffer", st.get("buy_ma_tolerance", 0.02))
+    max_zone_width = st.get("buy_zone_max_width_pct", 0.035)
+    adaptive = st.get("volatility_adaptive", {})
+    atr_period = adaptive.get("atr_period", 14)
+    atr_pct = (analysis or {}).get(f"atr{atr_period}_pct")
+    if atr_pct is None and atr_period == 14:
+        atr_pct = (analysis or {}).get("atr14_pct")
+    if not adaptive.get("enabled", True) or atr_pct is None:
+        return zone_buffer, max_zone_width
+
+    min_buffer = adaptive.get("min_buffer_pct", 0.01)
+    max_buffer = adaptive.get("max_buffer_pct", 0.06)
+    zone_buffer = _clamp(
+        atr_pct * adaptive.get("buy_zone_buffer_atr_multiplier", 1.0),
+        min_buffer,
+        max_buffer,
+    )
+    max_zone_width = _clamp(
+        atr_pct * adaptive.get("buy_zone_max_width_atr_multiplier", 1.0),
+        min_buffer,
+        max_buffer,
+    ) * 2
+    return zone_buffer, max_zone_width
+
+
 def buy_decision(a, cfg=None):
     if "error" in a:
         return {"signals": [], "score": 0, "verdict": "数据不足"}
+    cfg = apply_sentiment_adjustments(cfg, a.get("sentiment"))
     st = _strategy(cfg)
+    rs_cfg = st.get("relative_strength", {})
     sigs = []
     rsi_v = a["rsi14"]
     j = a["kdj"]["j"]
@@ -89,6 +190,21 @@ def buy_decision(a, cfg=None):
     else:
         sigs.append(("➖", "无明显底部反转K线形态"))
 
+    rs = a.get("relative_strength") or {}
+    rs_alpha_values = [
+        v for v in (rs.get("market_alpha_pct"), rs.get("peer_alpha_pct"))
+        if v is not None
+    ]
+    best_alpha = max(rs_alpha_values) if rs_alpha_values else None
+    first_support = (a.get("supports") or [None])[0]
+    support_near_pct = rs_cfg.get("support_near_pct", 0.005)
+    near_support = bool(
+        first_support and close and first_support.get("price")
+        and close <= first_support["price"] * (1 + support_near_pct)
+    )
+    if best_alpha is not None and near_support and best_alpha >= rs_cfg.get("support_bonus_alpha_pct", 2.0):
+        sigs.append(("✅", f"相对强弱为正({best_alpha:+.1f}%)，弱市中守住支撑"))
+
     first_res = (a.get("resistances") or [None])[0]
     broke_resistance = bool(first_res and close >= first_res.get("price", close + 1) * 0.998)
     if broke_resistance and a.get("volume_ratio", 1) < 0.8:
@@ -102,6 +218,37 @@ def buy_decision(a, cfg=None):
         else ("信号不足，继续等待" if score == 1 else "无买入信号，暂不建议追多")
     )
     return {"signals": sigs, "score": score, "verdict": verdict}
+
+
+def buy_decision_mtfa(analyses, cfg=None):
+    if not isinstance(analyses, dict):
+        return buy_decision(analyses, cfg)
+    daily = analyses.get("1d") or analyses.get("daily")
+    if not daily:
+        return {"signals": [], "score": 0, "verdict": "数据不足"}
+    result = buy_decision(daily, cfg)
+    intraday = analyses.get("15m") or analyses.get("60m") or analyses.get("5m")
+    if not intraday:
+        return result
+
+    mas = daily.get("ma", {})
+    ma5, ma10, ma20 = mas.get(5), mas.get(10), mas.get(20)
+    daily_bullish = bool(
+        daily.get("close") and ma20 and daily["close"] >= ma20
+        and (not ma5 or not ma10 or ma5 >= ma10 >= ma20)
+    )
+    intraday_rsi = intraday.get("rsi14")
+    intraday_reversal = bool((intraday.get("candle") or {}).get("is_long_lower_shadow"))
+    intraday_oversold = intraday_rsi is not None and intraday_rsi < _strategy(cfg).get("mtfa", {}).get("intraday_rsi_buy", 30)
+    if daily_bullish and (intraday_oversold or intraday_reversal):
+        enriched = dict(result)
+        signals = list(result.get("signals", []))
+        signals.append(("✅", "多周期共振：日线多头，短周期出现超卖/探底买点"))
+        enriched["signals"] = signals
+        enriched["score"] = result.get("score", 0) + _strategy(cfg).get("mtfa", {}).get("bonus_score", 2)
+        enriched["verdict"] = f"多周期共振买点，可分批试探（{enriched['score']}分）"
+        return enriched
+    return result
 
 
 def sell_decision(a, cfg=None):
@@ -160,6 +307,7 @@ def sell_decision(a, cfg=None):
 
 
 def momentum_decision(price_history, analysis, confirmation, sell=None, cfg=None):
+    cfg = apply_sentiment_adjustments(cfg, (analysis or {}).get("sentiment"))
     st = _strategy(cfg).get("momentum", {})
     if not st.get("enabled", True):
         return {"signals": [], "score": 0, "pct": None, "verdict": "动量规则关闭", "active": False}
@@ -173,7 +321,9 @@ def momentum_decision(price_history, analysis, confirmation, sell=None, cfg=None
     base_item = min(window[:-1], key=lambda x: x["price"]) if len(window) > 1 else window[0]
     base = base_item["price"]
     pct = (current / base - 1) * 100 if base else 0
-    intraday_low = min(x["price"] for x in window)
+    # 日内最低用自开盘以来全量分时队列（CLI 跨日已清空，保证同日），而非 20-tick 微窗。
+    # 否则早盘暴跌探底、午后暴力反转时，微窗只看到拉升前横盘，反弹幅度被严重低估。
+    intraday_low = min(x["price"] for x in history)
     rebound_from_low = (current / intraday_low - 1) * 100 if intraday_low else 0
     trigger_pct = st.get("trigger_pct", 3.0)
     strong_pct = st.get("strong_pct", 5.0)
@@ -182,10 +332,14 @@ def momentum_decision(price_history, analysis, confirmation, sell=None, cfg=None
     sell_score = (sell or {}).get("score", 0)
     confirm_min = st.get("confirm_min", 2)
     sell_block = st.get("sell_score_block", 3)
+    intraday = (analysis or {}).get("intraday") or {}
+    vwap_value = intraday.get("vwap")
+    vwap_volume_min = st.get("vwap_volume_ratio_min", 1.2)
 
     signals = []
     score = 0
-    blocked_by_rebound = rebound_from_low >= 3.5
+    rebound_limit = st.get("intraday_rebound_limit_pct", 3.5)
+    blocked_by_rebound = rebound_from_low >= rebound_limit
     if blocked_by_rebound:
         score -= 2
         signals.append(("❌", f"距日内低点已反弹+{rebound_from_low:.1f}%，放弃追高动量"))
@@ -205,6 +359,14 @@ def momentum_decision(price_history, analysis, confirmation, sell=None, cfg=None
     else:
         signals.append(("❌", f"卖出分={sell_score}，不适合追动量"))
 
+    blocked_by_vwap = bool(vwap_value and current < vwap_value)
+    if blocked_by_vwap:
+        score -= 2
+        signals.append(("❌", f"价格仍在VWAP下方({fmt_num(vwap_value)})，拦截诱多拉升"))
+    elif vwap_value and current >= vwap_value and (analysis or {}).get("volume_ratio", 1) >= vwap_volume_min:
+        score += 1
+        signals.append(("✅", f"站上VWAP({fmt_num(vwap_value)})且量比={(analysis or {}).get('volume_ratio')}"))
+
     first_res = (analysis or {}).get("resistances", [None])[0]
     broke_resistance = bool(first_res and current >= first_res.get("price", current + 1) * 0.998)
     if broke_resistance:
@@ -213,7 +375,7 @@ def momentum_decision(price_history, analysis, confirmation, sell=None, cfg=None
     elif first_res:
         signals.append(("➖", f"未突破近端阻力{first_res['level']}={fmt_num(first_res['price'])}"))
 
-    active = not blocked_by_rebound and score >= 3 and trigger_pct <= pct < chase_limit_pct
+    active = not blocked_by_rebound and not blocked_by_vwap and score >= 3 and trigger_pct <= pct < chase_limit_pct
     extended = blocked_by_rebound or (score >= 3 and pct >= chase_limit_pct)
     if extended:
         verdict = f"强动量已拉升，谨慎追高，等回踩或下一次预动量（+{pct:.1f}%）"
@@ -368,6 +530,29 @@ def confirmation_score(main, peers, market=None, cfg=None):
         if count and group_score >= count:
             total_peer_score += 1
 
+    main_pct = analysis_change_pct(main)
+    market_alpha = None
+    peer_alpha = None
+    rs_score = 0
+    peer_pct_values = []
+    peer_items = []
+    if isinstance(peers, dict):
+        for group_name, items in peers.items():
+            if group_name != "market":
+                peer_items.extend(items or [])
+    else:
+        peer_items = peers or []
+    for peer in peer_items:
+        pct = analysis_change_pct(peer)
+        if pct is not None:
+            peer_pct_values.append(pct)
+    if main_pct is not None and peer_pct_values:
+        peer_avg = sum(peer_pct_values) / len(peer_pct_values)
+        peer_alpha = round(main_pct - peer_avg, 2)
+        if peer_alpha >= st.get("rs_peer_outperform_pct", 2.0):
+            rs_score = 1
+            signals.append(("✅", f"相对强弱：主标的跑赢同组均值{peer_alpha:+.1f}%"))
+
     market_score = 0
     if market and "error" not in market:
         m_close = market.get("close")
@@ -381,23 +566,42 @@ def confirmation_score(main, peers, market=None, cfg=None):
         signals.append(("ℹ️", f"market 评分={market_score}/2"))
         if market_score >= 2:
             score += 1
+        market_pct = analysis_change_pct(market)
+        if main_pct is not None and market_pct is not None:
+            market_alpha = round(main_pct - market_pct, 2)
+            if market_alpha >= st.get("rs_market_outperform_pct", 2.0):
+                rs_score = 1
+                signals.append(("✅", f"相对强弱：主标的跑赢市场{market_alpha:+.1f}%"))
     if total_peer_score:
         score += 1
         signals.append(("✅", "确认对象整体偏强"))
     elif peers:
         signals.append(("❌", "确认对象分化或偏弱"))
+    score += rs_score
     if score >= 3:
         verdict = "确认层支持，趋势环境偏顺"
     elif score == 2:
         verdict = "确认层中性，适合等回撤"
     else:
         verdict = "确认层偏弱，先看不追"
-    return {"signals": signals, "score": score, "verdict": verdict, "group_scores": group_scores, "market_score": market_score}
+    return {
+        "signals": signals,
+        "score": score,
+        "verdict": verdict,
+        "group_scores": group_scores,
+        "market_score": market_score,
+        "relative_strength": {
+            "main_pct": main_pct,
+            "market_alpha_pct": market_alpha,
+            "peer_alpha_pct": peer_alpha,
+            "score": rs_score,
+        },
+    }
 
 
-def trade_plan(analysis, confirmation, cfg=None):
+def trade_plan(analysis, confirmation, cfg=None, position_highest=None):
     if not analysis or "error" in analysis:
-        return {"buy_zone": None, "watch_zone": None, "stop_loss": None, "take_profit": None, "note": "主标的数据不足"}
+        return {"buy_zone": None, "watch_zone": None, "stop_loss": None, "take_profit": None, "note": "主标的数据不足", "position_highest": position_highest}
     st = _strategy(cfg)
     close = analysis.get("close")
     supports = analysis.get("supports", [])
@@ -406,8 +610,7 @@ def trade_plan(analysis, confirmation, cfg=None):
     ma60 = mas.get(60)
     buy_score = buy_decision(analysis, cfg).get("score", 0)
     confirm_score = (confirmation or {}).get("score", 0)
-    zone_buffer = st.get("buy_zone_buffer", st.get("buy_ma_tolerance", 0.02))
-    max_zone_width = st.get("buy_zone_max_width_pct", 0.035)
+    zone_buffer, max_zone_width = _adaptive_zone_settings(analysis, st)
     entry_cfg = st.get("backtest", {})
     entry_buy_score = st.get("entry_buy_score", entry_cfg.get("entry_buy_score", 2))
     entry_confirm_score = st.get("entry_confirm_score", entry_cfg.get("entry_confirm_score", 2))
@@ -456,10 +659,12 @@ def trade_plan(analysis, confirmation, cfg=None):
         stop_loss = round(ma60 * (1 - st.get("stop_loss_ma60_buffer", 0.02)), 2)
     elif atr_like and close:
         stop_loss = round(close - atr_like * st.get("stop_loss_atr_multiplier", 1.5), 2)
-    recent = analysis.get("recent", [])
-    recent_high = max((r["high"] for r in recent if r.get("high") is not None), default=close)
-    if atr_like and recent_high:
-        trailing_stop = round(recent_high - atr_like * 2.0, 2)
+    # 吊灯追踪止损只在已持仓时激活：锚点为持仓以来最高价（position_highest），单调非递减。
+    # 未持仓时绝不使用历史 swing_high/recent_high 计算止损——否则标的深跌后 swing_high 仍高悬，
+    # 算出的 trailing_stop 会高于现价，导致一开仓就被止损踩踏割肉。
+    if position_highest and atr_like:
+        trailing_mult = st.get("short_term", {}).get("trailing_stop_atr_multiplier", 2.0)
+        trailing_stop = round(position_highest - atr_like * trailing_mult, 2)
         if stop_loss is None or trailing_stop > stop_loss:
             stop_loss = trailing_stop
     take_profit = []
@@ -482,53 +687,53 @@ def trade_plan(analysis, confirmation, cfg=None):
         "take_profit": take_profit,
         "note": note,
         "buy_ready": buy_ready,
+        "position_highest": position_highest,
     }
 
 
 def short_term_plan(analysis, cfg=None):
+    """超短线精密操盘矩阵：
+    等距向下三级接飞刀网格 (每级吸纳20%) ↔ 等距向上三级吃肉止盈网格 (每级派发20%)
+    """
     if not analysis or "error" in analysis:
         return {"entries": [], "exits": [], "deep_supports": [], "stop_loss": None, "note": "主标的数据不足"}
     st = _strategy(cfg).get("short_term", {})
     close = analysis.get("close")
     if close is None:
         return {"entries": [], "exits": [], "deep_supports": [], "stop_loss": None, "note": "价格数据不足"}
-    pullback_pct = st.get("pullback_pct", 0.012)
-    breakout_buffer = st.get("breakout_buffer_pct", 0.003)
+
+    # 步长由 config.json 的 pullback_pct 弹性控宽（默认 1.5%）
+    step_pct = st.get("pullback_pct", 0.015)
     stop_loss_pct = st.get("stop_loss_pct", 0.018)
     max_primary_pullback = st.get("max_primary_pullback_pct", 0.03)
     supports = analysis.get("supports", [])
-    resistances = analysis.get("resistances", [])
-    mas = analysis.get("ma", {})
 
+    # 左栏：向下等距阶梯跌幅吸纳网格
     entries = [
-        {"level": "近端回踩", "price": round(close * (1 - pullback_pct), 2), "kind": "pullback"},
+        {"level": "一档回踩 (吸纳20%)", "price": round(close * (1 - step_pct * 1), 2), "kind": "pullback"},
+        {"level": "二档极限 (吸纳20%)", "price": round(close * (1 - step_pct * 2), 2), "kind": "pullback"},
+        {"level": "三档铁底 (重仓20%)", "price": round(close * (1 - step_pct * 3), 2), "kind": "pullback"},
     ]
-    for p in (5, 10):
-        ma_price = mas.get(p)
-        if ma_price and abs(ma_price / close - 1) <= max_primary_pullback:
-            entries.append({"level": f"MA{p}回踩", "price": ma_price, "kind": "pullback"})
-    if resistances:
-        r = resistances[0]
-        entries.append({"level": f"突破{r['level']}", "price": round(r["price"] * (1 + breakout_buffer), 2), "kind": "breakout"})
 
-    deduped = []
-    seen = set()
-    for item in sorted(entries, key=lambda x: abs(x["price"] / close - 1)):
-        key = round(item["price"], 1)
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(item)
+    # 右栏：向上等距阶梯涨幅止盈网格
+    exits = [
+        {"level": "一档阻力 (派发20%)", "price": round(close * (1 + step_pct * 1), 2), "kind": "target"},
+        {"level": "二档高压 (派发20%)", "price": round(close * (1 + step_pct * 2), 2), "kind": "target"},
+        {"level": "三档波段 (清仓20%)", "price": round(close * (1 + step_pct * 3), 2), "kind": "target"},
+    ]
 
+    # 远端深回撤备用安全垫（跌幅超过 max_primary_pullback 的历史密集区）
     deep_supports = [s for s in supports if s.get("dist_pct", 0) < -max_primary_pullback * 100][:4]
-    exits = resistances[:4]
+
+    # 硬性风控割肉线
     stop_loss = round(close * (1 - stop_loss_pct), 2)
+
     return {
-        "entries": deduped[:4],
+        "entries": entries,
         "exits": exits,
         "deep_supports": deep_supports,
         "stop_loss": stop_loss,
-        "note": "短线计划优先看近端回踩/突破，深支撑只作备用",
+        "note": "日内等距仓位网格已激活：每级间距测算弹性，挂单严格对称",
     }
 
 

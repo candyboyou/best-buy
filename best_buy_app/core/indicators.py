@@ -60,6 +60,39 @@ def macd(rows, fast=12, slow=26, signal=9):
     return (dif[-1] - dea[-1]) * 2, dif[-1], dea[-1], dif[-2], dea[-2]
 
 
+def atr(rows, p=14):
+    if len(rows) < p + 1:
+        return None
+    true_ranges = []
+    for i in range(1, len(rows)):
+        high = rows[i]["high"]
+        low = rows[i]["low"]
+        prev_close = rows[i - 1]["close"]
+        true_ranges.append(max(high - low, abs(high - prev_close), abs(low - prev_close)))
+    return sum(true_ranges[-p:]) / p
+
+
+def vwap(rows):
+    # 已知限制：标准财经 API 盘中不返回累计成交额(amount)，此处缺 amount 时用
+    # typical_price=(H+L+C)/3 虚拟成交额。高脉冲标的(机构在极值点放量对倒)会
+    # 使虚拟 VWAP 偏离真实机构成本线。真正修复需接入返回累计成交额的数据源。
+    total_amount = 0.0
+    total_volume = 0.0
+    for row in rows or []:
+        volume = row.get("volume") or 0
+        if volume <= 0:
+            continue
+        amount = row.get("amount")
+        if amount is None:
+            typical_price = (row["high"] + row["low"] + row["close"]) / 3
+            amount = typical_price * volume
+        total_amount += amount
+        total_volume += volume
+    if not total_volume:
+        return None
+    return round(total_amount / total_volume, 4)
+
+
 def fib_retrace(rows, lb=60):
     w = rows[-lb:]
     if len(w) < 2:
@@ -126,7 +159,24 @@ def refresh_last_kline(rows, live, date=None):
     return rows[:-1] + [r]
 
 
-def analyze(rows, label):
+def _projected_volume(current_vol, intraday_ctx):
+    """盘中量能投影：将当日未走完的成交量按已交易进度推算为预期全天量。
+
+    U 型曲线保守化：上午(progress < morning_cutoff_progress)乘以 morning_deflation，
+    避免把开盘脉冲的爆发率线性外推为全天放量。返回 None 表示不投影（收盘/盘前/无 ctx）。
+    """
+    if not intraday_ctx or not intraday_ctx.get("is_open"):
+        return None
+    progress = intraday_ctx.get("progress") or 0
+    if progress <= 0:
+        return None
+    projected = current_vol / progress
+    if progress < intraday_ctx.get("morning_cutoff_progress", 0.5):
+        projected *= intraday_ctx.get("morning_deflation", 0.7)
+    return projected
+
+
+def analyze(rows, label, intraday_ctx=None):
     if not rows:
         return {"label": label, "error": "无K线数据"}
     close = rows[-1]["close"]
@@ -134,12 +184,28 @@ def analyze(rows, label):
     r = rsi(rows)
     k, d, j = kdj(rows)
     hist, dif, dea, dif2, dea2 = macd(rows)
+    atr14 = atr(rows, 14)
     hi, lo, fib_sup = fib_retrace(rows)
     _, _, fib_res = fib_ext(rows)
     mas = {p: ma(rows, p) for p in (5, 10, 20, 60)}
-    vol_5 = sum(r.get("volume", 0) or 0 for r in rows[-5:]) / 5 if len(rows) >= 5 else 0
+    # 追踪止损参考高点：取 60 周期（与 fib 回溯对齐）内的最高价，而非最近 6 根。
+    # 避免 strong-trend 标的创出高点后震荡阴跌、高点滑出 6 根视窗导致 trailing_stop 下移。
+    # 注意：滚动视窗只能延缓滑出，真正的跨调用单调非递减需持久化 highest_since_entry（TODO）。
+    swing_window = rows[-60:] if len(rows) >= 60 else rows
+    swing_high = max((r.get("high") for r in swing_window if r.get("high") is not None), default=None)
+    # 基准均量只用 5 根已收盘的历史 bar，剔除 rows[-1]（盘中未收盘的当根），
+    # 否则上午 10:00 当根 volume 极小会把 vol_5 拉低、量比虚高。
+    benchmark = rows[-6:-1] if len(rows) >= 6 else rows[:-1]
+    vol_5 = (sum(r.get("volume", 0) or 0 for r in benchmark) / len(benchmark)) if benchmark else 0
     current_vol = rows[-1].get("volume", 0) or 0
     vol_ratio = current_vol / vol_5 if vol_5 else 1.0
+    volume_projected = None
+    projected_vol = _projected_volume(current_vol, intraday_ctx)
+    if projected_vol is not None:
+        volume_projected = round(projected_vol, 2)
+        max_ratio = intraday_ctx.get("max_ratio", 3.0)
+        projected_ratio = projected_vol / vol_5 if vol_5 else 1.0
+        vol_ratio = max(0.0, min(projected_ratio, max_ratio))
 
     supports = []
     if fib_sup:
@@ -191,9 +257,22 @@ def analyze(rows, label):
             "bar": "红柱" if hist and hist > 0 else ("绿柱" if hist and hist < 0 else None),
             "shortening": (abs(hist) < abs((dif2 - dea2) * 2)) if (hist is not None and dif2 is not None and dea2 is not None) else None,
         },
+        "atr14": round(atr14, 2) if atr14 is not None else None,
+        "atr14_pct": round(atr14 / close, 4) if atr14 is not None and close else None,
+        "swing_high": round(swing_high, 2) if swing_high is not None else None,
         "candle": candle_shape(rows),
         "volume_ratio": round(vol_ratio, 2),
+        "volume_projected": volume_projected,
         "supports": supports,
         "resistances": resistances,
         "recent": [{"date": r["date"], "close": r["close"], "high": r["high"], "low": r["low"]} for r in rows[-6:]],
     }
+
+
+def analyze_timeframes(rows_by_timeframe, label):
+    analyses = {}
+    for timeframe, rows in (rows_by_timeframe or {}).items():
+        analysis = analyze(rows, f"{label}:{timeframe}")
+        analysis["timeframe"] = timeframe
+        analyses[timeframe] = analysis
+    return analyses

@@ -6,7 +6,7 @@ import json
 from statistics import mean
 
 from best_buy_app.core.config import load_config
-from best_buy_app.core.decision_engine import buy_decision, confirmation_score, sell_decision, trade_plan
+from best_buy_app.core.decision_engine import attach_relative_strength, buy_decision, confirmation_score, sell_decision, trade_plan
 from best_buy_app.core.indicators import analyze
 from best_buy_app.data.market_data import load_rows
 
@@ -50,9 +50,10 @@ def run_backtest(symbol, range_, cfg, peer_symbols=None, market_symbol=None):
         peer_analyses = [analyze(peer_rows[sym][: i + 1], sym) for sym in (peer_symbols or []) if len(peer_rows.get(sym, [])) > i]
         market_an = analyze(market_rows[: i + 1], market_symbol) if market_symbol and len(market_rows) > i else None
 
-        buy = buy_decision(an, cfg)
         sell = sell_decision(an, cfg)
         confirm = confirmation_score(an, peer_analyses, market_an, cfg)
+        an = attach_relative_strength(an, confirm)
+        buy = buy_decision(an, cfg)
         plan = trade_plan(an, confirm, cfg)
         price = rows[i]["close"]
 
